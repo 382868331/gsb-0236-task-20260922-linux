@@ -14,6 +14,13 @@
 * :class:`ChainLimitError`      —— **搜索/处理预算耗尽**：链长超过 100 块的接口
   上限，与“区块被证明非法”严格区分。
 * :class:`DuplicateBlockError`  —— 同一区块 ID 被重复提交。
+* :class:`PrunedBlockError`     —— 区块体已被最终确认检查点裁剪，只剩块头，
+  无法再取完整交易。
+* :class:`RequiresHistoryError` —— 深度重组/接块所需的祖先历史已被裁剪：
+  既未证明候选链合法也未证明非法，需要外部补全历史；稳定状态码
+  ``requires_history``。
+* :class:`CheckpointError` / :class:`CheckpointFormatError` —— 检查点导出/
+  恢复错误；后者表示落盘字节被篡改、截断或结构自相矛盾。
 """
 
 from __future__ import annotations
@@ -41,6 +48,71 @@ class DuplicateBlockError(LedgerError):
     def __init__(self, block_id: str):
         super().__init__(f"block {block_id!r} already exists in the block tree")
         self.block_id = block_id
+
+
+class PrunedBlockError(LedgerError):
+    """请求的区块体已被最终确认检查点裁剪（只剩块头，交易不可再取）。"""
+
+    def __init__(self, block_id: str):
+        super().__init__(
+            f"block {block_id!r} body has been pruned by finalization "
+            f"(header only)"
+        )
+        self.block_id = block_id
+
+
+class RequiresHistoryError(LedgerError):
+    """候选链需要的祖先历史已被裁剪，无法完成验证或深度重组。
+
+    这与“区块被证明非法”严格区分：候选链只是在已知信息下**不可判定**，
+    调用方需要取得被裁剪高度的历史块后（在未裁剪的账本上）重试。
+
+    稳定状态码为字面量 ``"requires_history"``（:attr:`status`）。
+    """
+
+    #: 稳定短码（供程序分支与跨语言/持久化格式使用）。
+    status = "requires_history"
+
+    def __init__(
+        self,
+        block_id: str,
+        anchor_id: str | None,
+        anchor_height: int | None,
+        fork_id: str | None,
+        missing_height: int | None = None,
+    ) -> None:
+        if anchor_id is None:
+            detail = "no finalized checkpoint history is available"
+        else:
+            detail = (
+                f"chain would diverge below finalized anchor "
+                f"{anchor_id!r} (height {anchor_height})"
+            )
+            if fork_id is not None and fork_id != anchor_id:
+                detail += f"; known fork point is {fork_id!r}"
+            if missing_height is not None:
+                detail += f"; history at/before height {missing_height} is required"
+        super().__init__(f"{self.status}: block {block_id!r}: {detail}")
+        self.block_id = block_id
+        self.anchor_id = anchor_id
+        self.anchor_height = anchor_height
+        self.fork_id = fork_id
+        self.missing_height = missing_height
+
+
+class CheckpointError(LedgerError):
+    """检查点导出/恢复的公共基类（IO 失败、未最终化即导出等）。"""
+
+
+class CheckpointFormatError(CheckpointError):
+    """落盘检查点字节被损坏、截断、信封不符或内容自相矛盾。
+
+    加载遇到本异常时不会产生新账本，也不会改动任何既有对象。
+    """
+
+    def __init__(self, message: str, *, reason: str = "corrupt-checkpoint") -> None:
+        super().__init__(f"{reason}: {message}")
+        self.reason = reason
 
 
 class OrphanBlockError(LedgerError):
