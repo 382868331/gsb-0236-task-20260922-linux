@@ -4,7 +4,8 @@
 
 * 数据结构：:class:`Block`、:class:`Transaction`、:class:`TxInput`、
   :class:`TxOutput`、:class:`UTXO`、:class:`OutPoint`
-* 引擎：:class:`ReorgLedger`、:class:`SubmitResult`、:class:`ReorgPath`
+* 引擎：:class:`ReorgLedger`、:class:`SubmitResult`、:class:`SubmitOutcome`、
+  :class:`HistoryRequired`、:class:`ReorgPath`、:class:`PrunedBlock`
 * 异常：见 :mod:`reorg_ledger.errors`
 * 常量：:data:`DEFAULT_SUBSIDY`、:data:`MAX_CHAIN_BLOCKS`
 
@@ -16,13 +17,17 @@ from __future__ import annotations
 from .engine import (
     DEFAULT_SUBSIDY,
     MAX_CHAIN_BLOCKS,
+    HistoryRequired,
+    PrunedBlock,
     ReorgLedger,
     ReorgPath,
+    SubmitOutcome,
     SubmitResult,
 )
 from .errors import (
     BlockValidationError,
     ChainLimitError,
+    CheckpointCorruptError,
     DuplicateBlockError,
     InputContractError,
     LedgerError,
@@ -41,7 +46,10 @@ __all__ = [
     "OutPoint",
     "ReorgLedger",
     "SubmitResult",
+    "SubmitOutcome",
+    "HistoryRequired",
     "ReorgPath",
+    "PrunedBlock",
     "LedgerError",
     "InputContractError",
     "NonFiniteNumberError",
@@ -49,6 +57,7 @@ __all__ = [
     "OrphanBlockError",
     "ChainLimitError",
     "DuplicateBlockError",
+    "CheckpointCorruptError",
     "LedgerStateError",
     "DEFAULT_SUBSIDY",
     "MAX_CHAIN_BLOCKS",

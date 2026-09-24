@@ -14,6 +14,8 @@
 * :class:`ChainLimitError`      —— **搜索/处理预算耗尽**：链长超过 100 块的接口
   上限，与“区块被证明非法”严格区分。
 * :class:`DuplicateBlockError`  —— 同一区块 ID 被重复提交。
+* :class:`CheckpointCorruptError` —— 检查点字节流损坏或内部不一致（校验和/指纹
+  不符、结构不合法），恢复被拒绝，不产生半成品账本。
 """
 
 from __future__ import annotations
@@ -41,6 +43,20 @@ class DuplicateBlockError(LedgerError):
     def __init__(self, block_id: str):
         super().__init__(f"block {block_id!r} already exists in the block tree")
         self.block_id = block_id
+
+
+class CheckpointCorruptError(LedgerError):
+    """检查点数据损坏或内部语义不一致，恢复被拒绝。
+
+    覆盖：字节流不是合法 JSON、顶层结构不符、magic/版本不符、参数不一致、
+    校验和不匹配、锚点状态指纹不一致、窗口块无法从锚点重放验证等。
+    以 :attr:`kind` 给出稳定短码。恢复失败时不构造任何半成品账本。
+    """
+
+    def __init__(self, kind: str, message: str):
+        super().__init__(f"{kind}: {message}")
+        self.kind = kind
+        self.message = message
 
 
 class OrphanBlockError(LedgerError):
