@@ -36,10 +36,24 @@ class LedgerStateError(LedgerError):
 
 
 class DuplicateBlockError(LedgerError):
-    """提交了树中已存在的区块 ID。"""
+    """提交了树中已存在的区块 ID（同内容幂等、异内容冲突均归此族）。"""
 
     def __init__(self, block_id: str):
         super().__init__(f"block {block_id!r} already exists in the block tree")
+        self.block_id = block_id
+
+
+class BlockConflictError(DuplicateBlockError):
+    """同一区块 ID 已存在，但两次提交的区块内容不一致。
+
+    它是 :class:DuplicateBlockError 的子类：按“重复 ID”统一捕获的旧调用方
+    仍能处理，新调用方则可区分“同内容幂等”与“同 ID 异内容冲突”。
+    """
+
+    def __init__(self, block_id: str):
+        super().__init__(
+            f"block {block_id!r} was already submitted with different content"
+        )
         self.block_id = block_id
 
 
@@ -52,6 +66,23 @@ class OrphanBlockError(LedgerError):
         )
         self.block_id = block_id
         self.parent_id = parent_id
+
+
+class AncestorInvalidError(LedgerError):
+    """区块的某个祖先已被证明非法。
+
+    孤块在缓冲期内不做 UTXO 验证；当缺失的父块（或更远祖先）到达并被证明
+    非法时，整棵已缓冲后代标记为 ancestor_invalid。此后即使某后代自身
+    的交易看起来合法，也不允许接入。
+    """
+
+    def __init__(self, block_id: str, ancestor_id: str):
+        super().__init__(
+            f"block {block_id!r} is rejected because its ancestor "
+            f"{ancestor_id!r} is invalid"
+        )
+        self.block_id = block_id
+        self.ancestor_id = ancestor_id
 
 
 class ChainLimitError(LedgerError):

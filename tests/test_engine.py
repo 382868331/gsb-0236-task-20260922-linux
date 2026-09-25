@@ -3,6 +3,7 @@
 import unittest
 
 from reorg_ledger import (
+    BlockConflictError,
     Block,
     BlockValidationError,
     ChainLimitError,
@@ -238,28 +239,36 @@ class RejectionTests(unittest.TestCase):
 
 
 class OrphanAndDuplicateTests(unittest.TestCase):
-    def test_orphan_then_parent_arrives_is_not_buffered(self) -> None:
+    def test_orphan_is_buffered_and_connects_when_parent_arrives(self) -> None:
         ledger = ReorgLedger()
         child = block("C", "missing-parent", 1, (coinbase("cbc", 50),))
-        with self.assertRaises(OrphanBlockError) as ctx:
-            ledger.submit(child)
-        self.assertEqual(ctx.exception.parent_id, "missing-parent")
-        self.assertNotIn("C", ledger)
-        # 引擎不缓存孤儿；父块到来后需重新提交子块。
+        result = ledger.submit(child)
+        self.assertTrue(result.buffered)
+        self.assertFalse(ledger.is_verified("C"))
+        self.assertTrue(ledger.is_buffered_orphan("C"))
+        self.assertIsNone(ledger.tip_id)
+        # 缓冲块不计入累计 work 候选、不提前应用交易。
+        self.assertEqual(ledger.snapshot_utxos(), {})
         ledger.submit(genesis())
-        with self.assertRaises(OrphanBlockError):
-            ledger.submit(child)  # 父 "missing-parent" 仍不存在
+        self.assertTrue(ledger.is_buffered_orphan("C"))
         parent = block("missing-parent", "G", 1, (coinbase("cbp", 50),))
-        ledger.submit(parent)
-        ledger.submit(child)
+        ledger.submit(parent)  # 父到达即按 ID 顺序递归接入 C
+        self.assertTrue(ledger.is_verified("C"))
         self.assertEqual(ledger.active_path, ("G", "missing-parent", "C"))
+        # OrphanBlockError 仍是公开异常类型（向后兼容的错误语义）。
+        self.assertTrue(issubclass(OrphanBlockError, Exception))
 
-    def test_duplicate_and_second_genesis(self) -> None:
+    def test_duplicate_is_idempotent_conflict_and_second_genesis(self) -> None:
         ledger = ReorgLedger()
         g = genesis()
-        ledger.submit(g)
-        with self.assertRaises(DuplicateBlockError):
-            ledger.submit(g)
+        first = ledger.submit(g)
+        again = ledger.submit(g)  # 同内容：幂等
+        self.assertEqual(again, first)
+        with self.assertRaises(BlockConflictError):
+            ledger.submit(
+                block("G", None, 11, (coinbase("gcb", 50),))
+            )
+        self.assertIsInstance(BlockConflictError("x"), DuplicateBlockError)
         with self.assertRaises(BlockValidationError) as ctx:
             ledger.submit(genesis(block_id="G2"))
         self.assertEqual(ctx.exception.reason, "multiple-genesis")

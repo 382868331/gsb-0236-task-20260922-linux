@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from .engine import (
+    DEFAULT_MAX_ORPHANS,
     DEFAULT_SUBSIDY,
     MAX_CHAIN_BLOCKS,
     ReorgLedger,
@@ -29,6 +30,8 @@ from .errors import (
     LedgerStateError,
     NonFiniteNumberError,
     OrphanBlockError,
+    AncestorInvalidError,
+    BlockConflictError,
 )
 from .models import Block, OutPoint, Transaction, TxInput, TxOutput, UTXO
 
@@ -50,6 +53,9 @@ __all__ = [
     "ChainLimitError",
     "DuplicateBlockError",
     "LedgerStateError",
+    "AncestorInvalidError",
+    "BlockConflictError",
     "DEFAULT_SUBSIDY",
     "MAX_CHAIN_BLOCKS",
+    "DEFAULT_MAX_ORPHANS",
 ]

@@ -21,12 +21,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .errors import (
+    AncestorInvalidError,
     BlockValidationError,
+    BlockConflictError,
     ChainLimitError,
-    DuplicateBlockError,
     InputContractError,
     LedgerStateError,
-    OrphanBlockError,
 )
 from .models import Block, OutPoint, Transaction, UTXO
 
@@ -36,10 +36,12 @@ __all__ = [
     "ReorgPath",
     "SubmitResult",
     "ReorgLedger",
+    "DEFAULT_MAX_ORPHANS",
 ]
 
 DEFAULT_SUBSIDY = 50
 MAX_CHAIN_BLOCKS = 100
+DEFAULT_MAX_ORPHANS = 32
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +77,68 @@ class SubmitResult:
     became_tip: bool
     reorganized: bool
     reorg: ReorgPath | None
+    buffered: bool = False
+    evicted_orphan_ids: tuple[str, ...] = ()
+
+
+def _check_block_structure(block: Block) -> None:
+    """不依赖 UTXO / 祖先状态的纯块内结构校验。
+
+    孤块缓冲前只运行这里的检查：coinbase 位置与唯一性、普通交易内输入是否
+    重复、块内交易 ID / OutPoint 是否自撞。涉及链历史的判定（输入存在性、
+    锁定高度、金额守恒、跨块 txid 复用、coinbase 手续费额度）一律推迟到
+    父块可达后做完整验证。
+    """
+
+    seen_tx_ids: set[str] = set()
+    seen_outpoints: set[OutPoint] = set()
+    coinbase: Transaction | None = None
+    for index, tx in enumerate(block.transactions):
+        if tx.tx_id in seen_tx_ids:
+            raise _ve(
+                "duplicate-txid",
+                "transaction id appears more than once within the same block",
+                block=block, tx=tx,
+            )
+        seen_tx_ids.add(tx.tx_id)
+
+        if tx.is_coinbase:
+            if coinbase is not None:
+                raise _ve(
+                    "multiple-coinbase",
+                    "a block contains more than one coinbase transaction",
+                    block=block, tx=tx,
+                )
+            if index != 0:
+                raise _ve(
+                    "coinbase-position",
+                    "a zero-input (coinbase) transaction is only allowed at "
+                    "transaction index 0",
+                    block=block, tx=tx,
+                )
+            coinbase = tx
+
+        local_inputs: set[OutPoint] = set()
+        for txin in tx.inputs:
+            op = txin.outpoint
+            if op in local_inputs:
+                raise _ve(
+                    "duplicate-input",
+                    "input is spent more than once within the same transaction",
+                    block=block, tx=tx, outpoint=op,
+                )
+            local_inputs.add(op)
+
+        for out_index in range(len(tx.outputs)):
+            op = OutPoint(tx.tx_id, out_index)
+            if op in seen_outpoints:
+                raise _ve(
+                    "duplicate-txid",
+                    "output point collides within the same block "
+                    "(transaction id reused)",
+                    block=block, tx=tx, outpoint=op,
+                )
+            seen_outpoints.add(op)
 
 
 @dataclass(slots=True)
@@ -269,6 +333,7 @@ class ReorgLedger:
         self,
         subsidy: int = DEFAULT_SUBSIDY,
         max_blocks: int = MAX_CHAIN_BLOCKS,
+        max_orphans: int = DEFAULT_MAX_ORPHANS,
     ) -> None:
         if isinstance(subsidy, bool):
             raise InputContractError("subsidy: bool is not accepted as an integer")
@@ -288,11 +353,35 @@ class ReorgLedger:
             raise InputContractError(
                 f"max_blocks: expected value >= 1, got {max_blocks}"
             )
+        if isinstance(max_orphans, bool):
+            raise InputContractError(
+                "max_orphans: bool is not accepted as an integer"
+            )
+        if not isinstance(max_orphans, int):
+            raise InputContractError(
+                f"max_orphans: expected int, got {type(max_orphans).__name__}"
+            )
+        if max_orphans < 0:
+            raise InputContractError(
+                f"max_orphans: expected value >= 0, got {max_orphans}"
+            )
         self._subsidy = subsidy
         self._max_blocks = max_blocks
+        self._max_orphans = max_orphans
         self._nodes: dict[str, _Node] = {}
         self._tip_id: str | None = None
         self._state = _UtxoState()
+        # --- 孤块缓冲（父块未知的区块，只做过不依赖 UTXO 的结构校验）---
+        # _orphans[id]   = Block
+        # _orphan_children[parent_id] = 该父块的直接孤儿子块 ID 集合
+        # _orphan_order  = 显式接收序（最早在前）
+        # _last_results[id] = 已验证块 / 缓冲块上次 submit 的 SubmitResult（幂等返回）
+        # _invalid_ancestor[id] = 导致该 ID 被否决的最近祖先 ID
+        self._orphans: dict[str, Block] = {}
+        self._orphan_children: dict[str, set[str]] = {}
+        self._orphan_order: list[str] = []
+        self._last_results: dict[str, SubmitResult] = {}
+        self._invalid_ancestor: dict[str, str] = {}
 
     # ------------------------------------------------------------------ 查询
 
@@ -303,6 +392,10 @@ class ReorgLedger:
     @property
     def max_blocks(self) -> int:
         return self._max_blocks
+
+    @property
+    def max_orphans(self) -> int:
+        return self._max_orphans
 
     @property
     def is_empty(self) -> bool:
@@ -333,10 +426,18 @@ class ReorgLedger:
         return self._path_to(self._tip_id)
 
     def __contains__(self, block_id: object) -> bool:
-        return isinstance(block_id, str) and block_id in self._nodes
+        return isinstance(block_id, str) and (
+            block_id in self._nodes
+            or block_id in self._orphans
+            or block_id in self._invalid_ancestor
+        )
 
     def contains(self, block_id: str) -> bool:
-        return block_id in self._nodes
+        return (
+            block_id in self._nodes
+            or block_id in self._orphans
+            or block_id in self._invalid_ancestor
+        )
 
     def get_block(self, block_id: str) -> Block:
         if not isinstance(block_id, str):
@@ -346,7 +447,35 @@ class ReorgLedger:
         try:
             return self._nodes[block_id].block
         except KeyError:
+            if block_id in self._orphans:
+                return self._orphans[block_id]
             raise KeyError(block_id) from None
+
+    def is_verified(self, block_id: str) -> bool:
+        """块是否已通过祖先状态验证并入树（含非活跃侧枝）。"""
+        return block_id in self._nodes
+
+    def is_buffered_orphan(self, block_id: str) -> bool:
+        """块是否在孤块缓冲区内等待缺失祖先。"""
+        return block_id in self._orphans
+
+    def is_ancestor_invalid(self, block_id: str) -> bool:
+        """块是否因其祖先（或自身）被证明非法而被否决。"""
+        return block_id in self._invalid_ancestor
+
+    def invalid_ancestor_of(self, block_id: str) -> str | None:
+        """否决该块的最近无效祖先 ID；未被否决时返回 None。"""
+        return self._invalid_ancestor.get(block_id)
+
+    def buffered_orphan_ids(self) -> tuple[str, ...]:
+        """缓冲中的孤块 ID，按显式接收序。"""
+        return tuple(self._orphan_order)
+
+    def orphan_count(self) -> int:
+        return len(self._orphans)
+
+    def orphan_buffer_available(self) -> int:
+        return self._max_orphans - len(self._orphans)
 
     def is_active(self, block_id: str) -> bool:
         if block_id not in self._nodes:
@@ -362,20 +491,41 @@ class ReorgLedger:
     def submit(self, block: Block) -> SubmitResult:
         """提交一个区块。
 
-        * 父块缺失 → :class:`OrphanBlockError`（既未证明合法也未证明非法）。
-        * 超出 100 块界 → :class:`ChainLimitError`（预算耗尽）。
-        * 祖先状态下证伪 → :class:`BlockValidationError`（证明无解/非法）。
-        * ID 重复 → :class:`DuplicateBlockError`。
+        * 父块未知（孤块）：只做不依赖 UTXO 的块内结构校验，通过后放入有上限
+          的待验证区（SubmitResult.buffered=True）。缓冲块不计入累计 work
+          候选、不提前应用交易。父块到达并验证成功后，按块 ID 字典序递归
+          接入可连通后代。
+        * 缓冲满：按显式接收序淘汰最早的整棵待验证子树，被淘汰 ID 见
+          SubmitResult.evicted_orphan_ids（接收序）；已验证主链/侧链不受影响。
+        * 祖先最终非法：缓冲后代整棵标 ancestor_invalid，再次提交抛
+          AncestorInvalidError，即使后代交易单独看似合法也不能接入。
+        * 同内容区块重复提交幂等返回原结果；同 ID 异内容抛 BlockConflictError
+          （DuplicateBlockError 子类）。
+        * 超出块数界抛 ChainLimitError（预算耗尽）；祖先状态下证伪抛
+          BlockValidationError（证明非法）。
 
-        任何失败都不会造成部分变更。成功且新链 work 胜出时原子完成重组。
+        失败不产生未说明的部分变更；成功且新链 work 胜出时原子完成重组。
         """
         if not isinstance(block, Block):
             raise InputContractError(
                 f"submit: expected Block, got {type(block).__name__}"
             )
 
-        if block.block_id in self._nodes:
-            raise DuplicateBlockError(block.block_id)
+        existing = self._nodes.get(block.block_id)
+        if existing is not None:
+            if existing.block != block:
+                raise BlockConflictError(block.block_id)
+            return self._last_results[block.block_id]
+        if block.block_id in self._orphans:
+            if self._orphans[block.block_id] != block:
+                raise BlockConflictError(block.block_id)
+            return self._last_results[block.block_id]
+        if block.block_id in self._invalid_ancestor:
+            raise AncestorInvalidError(
+                block.block_id, self._invalid_ancestor[block.block_id]
+            )
+
+        _check_block_structure(block)
 
         if block.parent_id is None:
             if self._nodes:
@@ -385,20 +535,152 @@ class ReorgLedger:
                     "genesis already exists",
                     block=block,
                 )
-            parent_node = None
-        else:
-            parent_node = self._nodes.get(block.parent_id)
-            if parent_node is None:
-                raise OrphanBlockError(block.block_id, block.parent_id)
+            return self._connect(block)
+
+        if block.parent_id in self._invalid_ancestor:
+            ancestor_id = self._invalid_ancestor[block.parent_id]
+            self._mark_invalid_subtree(block.block_id, ancestor_id)
+            raise AncestorInvalidError(block.block_id, ancestor_id)
+
+        if block.parent_id not in self._nodes:
+            evicted = self._evict_for(1)
+            self._orphans[block.block_id] = block
+            self._orphan_order.append(block.block_id)
+            self._orphan_children.setdefault(block.parent_id, set()).add(
+                block.block_id
+            )
+            result = SubmitResult(
+                block_id=block.block_id,
+                block_height=0,
+                tip_id=self._tip_id,  # type: ignore[arg-type]
+                tip_height=0 if self._tip_id is None
+                else self._nodes[self._tip_id].height,
+                cumulative_work=self.cumulative_work,
+                became_tip=False,
+                reorganized=False,
+                reorg=None,
+                buffered=True,
+                evicted_orphan_ids=tuple(evicted),
+            )
+            self._last_results[block.block_id] = result
+            return result
+
+        return self._connect(block)
+
+    # -------------------------------------------------------------- 内部工具
+
+    def _with_eviction(
+        self, result: SubmitResult, evicted: list[str]
+    ) -> SubmitResult:
+        if not evicted:
+            return result
+        return SubmitResult(
+            block_id=result.block_id,
+            block_height=result.block_height,
+            tip_id=result.tip_id,
+            tip_height=result.tip_height,
+            cumulative_work=result.cumulative_work,
+            became_tip=result.became_tip,
+            reorganized=result.reorganized,
+            reorg=result.reorg,
+            buffered=result.buffered,
+            evicted_orphan_ids=tuple(evicted),
+        )
+
+    def _evict_for(self, needed_slots: int) -> list[str]:
+        """按显式接收序淘汰最早的整棵待验证子树，直到腾出足够槽位。
+
+        根 = 其父块不在缓冲区中的孤块（父块可能已验证或完全未知）。淘汰根
+        即移除其整棵缓冲后代。返回被淘汰 ID（显式接收序）。已验证的主链与
+        侧链不在缓冲中，不受影响。
+        """
+        evicted: list[str] = []
+        limit = self._max_orphans
+        while len(self._orphans) + needed_slots > limit:
+            root_id = next(
+                candidate for candidate in self._orphan_order
+                if candidate in self._orphans
+                and self._orphans[candidate].parent_id not in self._orphans
+            )
+            evicted.extend(self._remove_orphan_subtree(root_id))
+        return evicted
+
+    def _remove_orphan_subtree(self, root_id: str) -> list[str]:
+        """从缓冲区移除以 root_id 为根的整棵子树，返回按接收序排列的 ID。"""
+        removed: list[str] = []
+        stack = [root_id]
+        while stack:
+            current = stack.pop()
+            block = self._orphans.pop(current, None)
+            if block is None:
+                continue
+            removed.append(current)
+            stack.extend(
+                cid for cid in sorted(self._orphan_children.get(current, ()))
+                if cid in self._orphans
+            )
+        order_index = {
+            bid: index for index, bid in enumerate(self._orphan_order)
+        }
+        removed.sort(key=lambda bid: order_index[bid])
+        removed_set = set(removed)
+        for current in removed:
+            self._orphan_order.remove(current)
+            self._orphan_children.pop(current, None)
+            self._last_results.pop(current, None)
+        for children in self._orphan_children.values():
+            children -= removed_set
+        return removed
+
+    def _detach_orphan(self, block_id: str) -> None:
+        """单个孤块验证通过后离开缓冲区（不触碰其缓冲后代）。"""
+        if block_id not in self._orphans:
+            return
+        block = self._orphans.pop(block_id)
+        self._orphan_order.remove(block_id)
+        siblings = self._orphan_children.get(block.parent_id)
+        if siblings is not None:
+            siblings.discard(block_id)
+        self._orphan_children.pop(block_id, None)
+
+    def _mark_invalid_subtree(self, root_id: str, ancestor_id: str) -> None:
+        """把以 root_id 为根（含根本身，若在缓冲中）的整棵后代标为无效。"""
+        removed: list[str] = []
+        stack = [root_id] if root_id in self._orphans else sorted(
+            self._orphan_children.get(root_id, set())
+        )
+        while stack:
+            current = stack.pop()
+            if current not in self._orphans:
+                continue
+            self._orphans.pop(current)
+            removed.append(current)
+            stack.extend(sorted(self._orphan_children.get(current, set())))
+        order_index = {
+            bid: index for index, bid in enumerate(self._orphan_order)
+        }
+        removed.sort(key=lambda bid: order_index[bid])
+        removed_set = set(removed)
+        for current in removed:
+            self._orphan_order.remove(current)
+            self._orphan_children.pop(current, None)
+            self._last_results.pop(current, None)
+            self._invalid_ancestor[current] = ancestor_id
+        for children in self._orphan_children.values():
+            children -= removed_set
+
+    def _connect(self, block: Block) -> SubmitResult:
+        """验证并接入一个父块已就绪的区块（临时状态验证 + 选链 + 原子提交）。"""
+        parent_id = block.parent_id
+        parent_node = None if parent_id is None else self._nodes[parent_id]
 
         height = 1 if parent_node is None else parent_node.height + 1
         if height > self._max_blocks:
-            # 预算/有界性拒绝：不做“合法与否”的判定，与证伪严格分开。
             raise ChainLimitError(block.block_id, height, self._max_blocks)
 
         candidate = _Node(
             block=block,
-            parent_id=block.parent_id,
+            parent_id=parent_id,
             height=height,
             cumulative_work=(
                 block.work if parent_node is None
@@ -406,16 +688,16 @@ class ReorgLedger:
             ),
         )
 
-        # 1) 以祖先状态验证：从创世重放父链，再应用本块（纯临时状态）。
         ancestor_state = self._replay_chain(
             () if parent_node is None else self._path_to(parent_node.block_id)
         )
-        _apply_block_to_state(ancestor_state, block, height, self._subsidy)
+        try:
+            _apply_block_to_state(ancestor_state, block, height, self._subsidy)
+        except BlockValidationError:
+            self._mark_invalid_subtree(block.block_id, block.block_id)
+            raise
 
-        # 2) 选链：全部已验证节点 + 候选节点，累计 work 降序、ID 字典序升序。
         new_tip_id = self._select_tip(candidate)
-
-        # 3) 需要切换时，先在临时状态重放整条新链（撤销旧链 + 应用新链）。
         new_state: _UtxoState | None = None
         reorg: ReorgPath | None = None
         old_tip_id = self._tip_id
@@ -428,7 +710,6 @@ class ReorgLedger:
                     old_tip_id, new_tip_id, candidate
                 )
                 if deactivated:
-                    # 同链向前延伸（无撤销块）不是重组。
                     reorg = ReorgPath(
                         fork_id=fork_id,
                         old_tip=old_tip_id,
@@ -437,16 +718,18 @@ class ReorgLedger:
                         activated=activated,
                     )
 
-        # 4) 原子提交：以上全部成功后才修改自身状态。
         self._nodes[block.block_id] = candidate
         if new_tip_id != old_tip_id:
             assert new_state is not None
             self._state.commit(new_state)
             self._tip_id = new_tip_id
 
-        return SubmitResult(
+        if block.block_id in self._orphans:
+            self._detach_orphan(block.block_id)
+
+        result = SubmitResult(
             block_id=block.block_id,
-            block_height=self._nodes[block.block_id].height,
+            block_height=height,
             tip_id=self._tip_id,  # type: ignore[arg-type]
             tip_height=self._nodes[self._tip_id].height if self._tip_id else 0,
             cumulative_work=(
@@ -456,8 +739,31 @@ class ReorgLedger:
             reorganized=reorg is not None,
             reorg=reorg,
         )
+        self._last_results[block.block_id] = result
 
-    # -------------------------------------------------------------- 内部工具
+        # 缓冲关系可能在本块接入过程中变化（整棵子树移除），按剩余缓冲重建。
+        children: dict[str, set[str]] = {}
+        for bid, blk in self._orphans.items():
+            children.setdefault(blk.parent_id, set()).add(bid)
+        self._orphan_children = children
+        self._connect_children(block.block_id)
+        return result
+
+    def _connect_children(self, parent_id: str) -> None:
+        """按块 ID 字典序递归接入一个已验证块的缓冲直接后代。"""
+        child_ids = sorted(self._orphan_children.get(parent_id, ()))
+        for child_id in child_ids:
+            child = self._orphans.get(child_id)
+            if child is None:
+                continue
+            try:
+                self._connect(child)
+            except ChainLimitError:
+                # 预算耗尽不是非法：保留该子树在缓冲区，停止本分支级联。
+                break
+            except BlockValidationError:
+                # 子块已证明非法，其后代已在 _connect 内标记；继续兄弟分支。
+                continue
 
     def _lookup(self, node_id: str, candidate: _Node | None) -> _Node:
         if candidate is not None and node_id == candidate.block.block_id:

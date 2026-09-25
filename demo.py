@@ -18,6 +18,7 @@ from __future__ import annotations
 import time
 
 from reorg_ledger import (
+    AncestorInvalidError,
     Block,
     BlockValidationError,
     ChainLimitError,
@@ -40,6 +41,38 @@ def transfer(tx_id: str, prev: str, amount: int, lock: int = 0) -> Transaction:
 
 def main() -> None:
     started = time.perf_counter()
+
+    print("=== 0. 孤块缓冲边界：孙块先到、缓冲满淘汰最早整棵子树 ===")
+    small_orphan = ReorgLedger(subsidy=50, max_blocks=100, max_orphans=2)
+    # 孙块 X2 先于父块 X1、祖父 g0 到达：只做结构校验后缓冲。
+    x2 = Block("X2", "X1", 1, (coinbase("x2-cb", 50),))
+    buffered = small_orphan.submit(x2)
+    print(f"孙块 X2 先到：buffered={buffered.buffered}, tip={small_orphan.tip_id}, "
+          f"缓冲={list(small_orphan.buffered_orphan_ids())}")
+    small_orphan.submit(Block("X1", "g0", 1, (coinbase("x1-cb", 50),)))
+    y = Block("Y", "gy", 1, (coinbase("y-cb", 50),))
+    evict_result = small_orphan.submit(y)  # 容量 2 已满
+    print(f"Y 到达触发淘汰：evicted={list(evict_result.evicted_orphan_ids)} "
+          f"（最早整棵子树 X1+X2），剩余缓冲={list(small_orphan.buffered_orphan_ids())}")
+
+    # 祖先无效连坐：父块 coinbase 超额，缓冲后代标 ancestor_invalid。
+    doomed = ReorgLedger(max_orphans=8)
+    doomed.submit(Block("g0", None, 1, (coinbase("g0-cb", 50, lock=1),)))
+    child = Block("ch", "bad", 1, (coinbase("ch-cb", 50),))
+    doomed.submit(child)
+    bad_parent = Block("bad", "g0", 1, (coinbase("bad-cb", 999),))
+    try:
+        doomed.submit(bad_parent)
+    except BlockValidationError as exc:
+        print(f"父块非法：reason={exc.reason}, block={exc.block_id}")
+    print(f"缓冲后代 ch 是否 ancestor_invalid: "
+          f"{doomed.is_ancestor_invalid('ch')} -> "
+          f"{doomed.invalid_ancestor_of('ch')}")
+    try:
+        doomed.submit(child)
+    except AncestorInvalidError as exc:
+        print(f"后代单独重提被连坐拒绝（AncestorInvalidError）: {exc}")
+    print()
 
     print("=== 1. 正常结果：侧枝累计 work 反超，触发真实重组 ===")
     ledger = ReorgLedger(subsidy=50, max_blocks=100)
