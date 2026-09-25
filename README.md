@@ -1,8 +1,9 @@
 # 有界 UTXO 链重组的撤销账本（bounded UTXO reorg ledger）
 
 一个**仅用 Python 3.14.7 标准库**实现的内存区块树 + UTXO 账本，支持侧枝接收、
-累计工作量选链与“撤销旧链 → 应用新链”的原子重组。不验证 PoW，区块 ID 为
-合成唯一字符串。核心、测试、演示全部离线运行，无第三方依赖。
+累计工作量选链、“撤销旧链 → 应用新链”的原子重组，以及**孤块缓冲**（父块
+未知时暂存、父块到达后递归接入）。不验证 PoW，区块 ID 为合成唯一字符串。
+核心、测试、演示全部离线运行，无第三方依赖。
 
 ## 运行环境
 
@@ -13,11 +14,15 @@
 ## 准确命令
 
 ```bash
-# 必要测试（28 个，含确定性差分测试）
+# 必要测试（37 个，含确定性差分测试与孤块缓冲测试）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（真实重组 + 实际触发的拒绝/异常边界，实测 < 0.1 秒）
+# 固定输入演示（真实重组 + 孤块接入 + 实际触发的拒绝/异常边界，实测 < 0.1 秒）
 python demo.py
+```
+
+仓库内解释器统一为 `./.venv/bin/python`（即
+`./.venv/bin/python -m unittest discover -s tests -v`）。
 ```
 
 ## 目录结构
@@ -33,6 +38,7 @@ tests/
   test_models.py  入口契约测试
   test_engine.py  场景测试
   test_differential.py  固定种子随机树差分测试（参考实现作预言机）
+  test_orphans.py 孤块缓冲测试（暂存/递归接入/ancestor_invalid/淘汰/全排列差分）
 demo.py           固定输入演示
 ```
 
@@ -56,8 +62,9 @@ from reorg_ledger import (
     ReorgLedger, Block, Transaction, TxInput, TxOutput,
 )
 
-ledger = ReorgLedger(subsidy=50, max_blocks=100)
-result = ledger.submit(block)          # 提交区块（见下文错误语义）
+ledger = ReorgLedger(subsidy=50, max_blocks=100, orphan_capacity=128)
+result = ledger.submit(block)          # 提交区块（父缺失抛 OrphanBlockError）
+receipt = ledger.receive(block)        # 接收区块（父缺失进孤块缓冲，见下文）
 
 ledger.tip_id          # 当前 tip 区块 ID（空树为 None）
 ledger.tip             # 当前 tip 的 Block
@@ -67,6 +74,10 @@ ledger.active_path     # tuple[str,...]：创世 → tip
 ledger.snapshot_utxos()# dict[OutPoint, UTXO]：tip 处 UTXO 的副本
 ledger.contains(bid)   # 区块是否在树中（含非活跃侧枝）
 ledger.get_block(bid)  # 取块；不存在抛 KeyError
+ledger.pending_orphans()    # tuple[str,...]：待验证区块 ID，按接收序
+ledger.pending_count        # 待验证区中的孤块数量
+ledger.orphan_status(bid)   # "pending" / "ancestor_invalid" / None
+ledger.orphan_capacity      # 待验证区容量上限
 ```
 
 `submit` 返回 `SubmitResult`：
@@ -82,6 +93,41 @@ deactivated, activated)`：
 - `deactivated`：旧 tip 向下至分叉点之后的被撤销块（撤销顺序）
 - `activated`：分叉点之后向上至新 tip 的被应用块（应用顺序）
 - 同链向前延伸（无撤销块）时 `reorganized=False`、`reorg=None`
+
+`receive` 返回 `ReceiveResult`：
+
+```python
+ReceiveResult(block_id, status, submit, connected, invalidated, evicted)
+```
+
+- `status`：`"connected"`（已验证接入）/ `"buffered"`（父未知，已暂存）/
+  `"duplicate"`（同 ID 同内容幂等）/ `"ancestor_invalid"`（祖先已证伪）
+- `connected`：本次新接入的块 ID（含按块 ID 字典序递归接入的缓冲后代）
+- `invalidated`：本次被标为 `ancestor_invalid` 的缓冲块 ID
+- `evicted`：缓冲满时按接收序淘汰的整棵待验证子树的块 ID
+
+## 孤块缓冲（receive）
+
+`submit` 保持原语义（父缺失抛 `OrphanBlockError`、不缓存孤儿）；`receive`
+在其上增加孤块缓冲：
+
+1. **父块未知时只做不依赖 UTXO 的结构校验**（coinbase 位置与数量、块内
+   交易 ID 重复、交易内输入重复），通过后放入有上限的待验证区；结构错误
+   即使父未知也立即抛 `BlockValidationError`。
+2. **暂存期间不计入累计 work 候选、不应用任何交易**：tip、活跃链、UTXO
+   完全不受缓冲内容影响。
+3. **父块到达并验证成功后**，按块 ID 字典序递归处理可接入的缓冲后代，
+   每个后代走与 `submit` 相同的祖先状态验证与原子重组。
+4. **父块（或任一祖先）被证伪时**，其全部缓冲后代标记为
+   `ancestor_invalid` 并移出待验证区；它们**不能**因为单独交易看起来合法
+   而接入，重复接收幂等返回 `"ancestor_invalid"`。
+5. **幂等与冲突**：同 ID 同内容重复接收幂等（`status="duplicate"`）；
+   同 ID 异内容抛 `ConflictingBlockError`（`DuplicateBlockError` 子类，
+   旧的统一捕获不受影响）。
+6. **缓冲淘汰**：待验证区满（`orphan_capacity`，默认 128）时，按显式接收
+   序淘汰**最早的整棵待验证子树**，淘汰 ID 经 `ReceiveResult.evicted`
+   返回；淘汰只影响待验证区，不影响已验证的主链与侧链。被淘汰的块可
+   重新接收。
 
 ## 协议语义（本题契约子集）
 
@@ -121,6 +167,7 @@ deactivated, activated)`：
 | `OrphanBlockError` | 父块未知；**既未证明合法也未证明非法**，不缓存孤儿 | `block_id`, `parent_id` |
 | `ChainLimitError` | **预算耗尽**：链长超过 100，与“非法”严格区分 | `depth`, `limit` |
 | `DuplicateBlockError` | 同一区块 ID 重复提交 | `block_id` |
+| `ConflictingBlockError` | 同 ID **异内容**重复接收（`DuplicateBlockError` 子类） | `block_id` |
 
 - **整数纯度**：所有整数参数拒绝 `bool`（`True/False` 不当作 1/0），拒绝
   浮点（不做静默取整）；浮点 `NaN/Infinity` 给 `NonFiniteNumberError`，
@@ -159,6 +206,10 @@ deactivated, activated)`：
   恰好等于补贴+手续费的通过边界）、锁定高度（`lock == height` 可花、
   `lock > height` 拒绝）、无效侧枝不入树且不污染主链、孤儿块、重复块、
   同分字典序决胜、真实重组与重组回旧链、100 块界、失败原子性、入口契约。
+- 孤块缓冲覆盖：孙块先到后递归接入、父块双花导致后代 `ancestor_invalid`、
+  两个孤块链竞争、缓冲淘汰顺序与淘汰 ID、幂等/冲突，以及**同一有效区块集
+  全排列（5! = 120 种接收顺序）与父先到顺序的最终 tip/UTXO 对照**；每种
+  排列的每一步接收后都用独立参考重放核对活跃链状态（重组原子性）。
 
 ## demo.py 输出内容
 
@@ -169,13 +220,18 @@ deactivated, activated)`：
    `BlockValidationError(reason='missing-input', block, tx, height, outpoint)`，
    并展示 tip/活跃链零变化、坏块不入树；另真实触发 `ChainLimitError`
    （小块界演示预算语义）与 `InputContractError`（bool 被拒作整数）。
+3. **孤块缓冲正常路径**：孙块、子块先于父块到达被暂存（暂存期间 tip 与
+   累计 work 不变），父块到达后按块 ID 顺序递归接入，活跃链延伸到孙块。
+4. **实际边界**：`orphan_capacity=2` 的缓冲被第三个孤块触发淘汰，按接收序
+   淘汰最早整棵待验证子树并打印淘汰 ID，主链 tip 不受影响。
 
 ## 已知限制
 
 - 仅实现本题的有限协议子集：无签名/脚本验证、无时间戳与时间锁、无对等网络、
   无持久化、无内存池/费用市场、无难度调整，**不宣称与任何行业完整协议
   （Bitcoin 等）兼容**。
-- 不缓存孤儿块：父块未知直接抛 `OrphanBlockError`，父块到达后需重新提交子块。
+- `submit` 不缓存孤儿块（父块未知直接抛 `OrphanBlockError`）；孤块缓冲
+  语义由 `receive` 提供，待验证区为纯内存结构，无持久检查点。
 - 不验证 PoW；`work` 是调用方给定的正整数，只用于累计比较。
 - 重放式实现面向 ≤100 块的有界场景；远超该规模时性能不做承诺。
 - 区块与交易结构由调用方负责构造，合成 ID 的全局唯一性由提交侧保证；同一 ID

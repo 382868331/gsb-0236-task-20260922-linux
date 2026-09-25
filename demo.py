@@ -132,6 +132,34 @@ def main() -> None:
     except InputContractError as exc:
         print(f"契约错误（bool 拒绝当整数）: {exc}")
 
+    print()
+    print("=== 3. 孤块缓冲：孙块先到，父块到达后递归接入 ===")
+    ledger2 = ReorgLedger(subsidy=50, orphan_capacity=3)
+    ledger2.receive(Block("G2", None, 10, (coinbase("g2-cb", 50),)))
+    # 孙块、子块先于父块到达：仅结构校验后暂存，不影响 tip / 累计 work。
+    r_gc = ledger2.receive(Block("GC", "P", 5, (coinbase("gc-cb", 50),)))
+    r_ch = ledger2.receive(Block("CH", "G2", 1, (coinbase("ch-cb", 50),)))
+    print(f"孙块 GC 先到: status={r_gc.status}, "
+          f"待验证区={list(ledger2.pending_orphans())}")
+    print(f"暂存期间 tip={ledger2.tip_id}, 累计 work={ledger2.cumulative_work}, "
+          f"GC 未入树: {'GC' not in ledger2}")
+    # 父块 P 到达并验证成功 → 按块 ID 字典序递归接入后代。
+    r_p = ledger2.receive(Block("P", "CH", 5, (coinbase("p-cb", 50),)))
+    print(f"父块 P 到达: connected={list(r_p.connected)}")
+    print(f"接入后活跃链={list(ledger2.active_path)}, tip={ledger2.tip_id}, "
+          f"累计 work={ledger2.cumulative_work}")
+
+    print()
+    print("=== 4. 实际边界：孤块缓冲满，按接收序淘汰最早整棵子树 ===")
+    ledger3 = ReorgLedger(subsidy=50, orphan_capacity=2)
+    ledger3.receive(Block("G3", None, 10, (coinbase("g3-cb", 50),)))
+    ledger3.receive(Block("O1", "missing-1", 1, (coinbase("o1-cb", 50),)))
+    ledger3.receive(Block("O1C", "O1", 1, (coinbase("o1c-cb", 50),)))
+    r_ev = ledger3.receive(Block("O2", "missing-2", 1, (coinbase("o2-cb", 50),)))
+    print(f"缓冲容量=2，第三个孤块触发淘汰: evicted={list(r_ev.evicted)}")
+    print(f"淘汰后待验证区={list(ledger3.pending_orphans())}, "
+          f"主链 tip={ledger3.tip_id} 不受影响")
+
     elapsed = time.perf_counter() - started
     print()
     print(f"演示完成，实际耗时 {elapsed:.3f} 秒（无 sleep、无预录结果）。")

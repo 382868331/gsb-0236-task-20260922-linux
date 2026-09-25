@@ -43,6 +43,21 @@ class DuplicateBlockError(LedgerError):
         self.block_id = block_id
 
 
+class ConflictingBlockError(DuplicateBlockError):
+    """同一区块 ID 被以**不同内容**再次提交（同内容重复是幂等成功）。
+
+    继承 :class:`DuplicateBlockError`，旧的统一捕获代码无需修改。
+    """
+
+    def __init__(self, block_id: str):
+        LedgerError.__init__(
+            self,
+            f"block {block_id!r} was already submitted with different content; "
+            f"same-id different-content resubmission is rejected",
+        )
+        self.block_id = block_id
+
+
 class OrphanBlockError(LedgerError):
     """父块未知：缺少祖先，无法以祖先状态验证该区块。"""
 

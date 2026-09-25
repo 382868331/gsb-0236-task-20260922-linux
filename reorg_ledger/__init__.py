@@ -16,6 +16,8 @@ from __future__ import annotations
 from .engine import (
     DEFAULT_SUBSIDY,
     MAX_CHAIN_BLOCKS,
+    DEFAULT_ORPHAN_CAPACITY,
+    ReceiveResult,
     ReorgLedger,
     ReorgPath,
     SubmitResult,
@@ -23,6 +25,7 @@ from .engine import (
 from .errors import (
     BlockValidationError,
     ChainLimitError,
+    ConflictingBlockError,
     DuplicateBlockError,
     InputContractError,
     LedgerError,
@@ -41,6 +44,7 @@ __all__ = [
     "OutPoint",
     "ReorgLedger",
     "SubmitResult",
+    "ReceiveResult",
     "ReorgPath",
     "LedgerError",
     "InputContractError",
@@ -49,7 +53,9 @@ __all__ = [
     "OrphanBlockError",
     "ChainLimitError",
     "DuplicateBlockError",
+    "ConflictingBlockError",
     "LedgerStateError",
     "DEFAULT_SUBSIDY",
     "MAX_CHAIN_BLOCKS",
+    "DEFAULT_ORPHAN_CAPACITY",
 ]

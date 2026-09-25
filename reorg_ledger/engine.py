@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from .errors import (
     BlockValidationError,
     ChainLimitError,
+    ConflictingBlockError,
     DuplicateBlockError,
     InputContractError,
     LedgerStateError,
@@ -33,13 +34,16 @@ from .models import Block, OutPoint, Transaction, UTXO
 __all__ = [
     "DEFAULT_SUBSIDY",
     "MAX_CHAIN_BLOCKS",
+    "DEFAULT_ORPHAN_CAPACITY",
     "ReorgPath",
     "SubmitResult",
+    "ReceiveResult",
     "ReorgLedger",
 ]
 
 DEFAULT_SUBSIDY = 50
 MAX_CHAIN_BLOCKS = 100
+DEFAULT_ORPHAN_CAPACITY = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,6 +79,35 @@ class SubmitResult:
     became_tip: bool
     reorganized: bool
     reorg: ReorgPath | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiveResult:
+    """``receive`` 的结果：孤块缓冲语义下的区块接收回执。
+
+    * ``status`` —— ``"connected"``（已验证并接入区块树）、
+      ``"buffered"``（父块未知，仅通过结构校验后放入待验证区）、
+      ``"duplicate"``（同 ID 同内容幂等重复，无任何状态变更）、
+      ``"ancestor_invalid"``（祖先已被证伪，直接标记，不入缓冲）。
+    * ``submit`` —— 本块接入时的 :class:`SubmitResult`，未接入为 ``None``。
+    * ``connected`` —— 本次调用新接入区块树的块 ID（含本块及被递归
+      处理的缓冲后代，后代按块 ID 字典序处理）。
+    * ``invalidated`` —— 本次被标为 ``ancestor_invalid`` 的缓冲块 ID。
+    * ``evicted`` —— 缓冲满时按接收序被淘汰的整棵待验证子树的块 ID。
+    """
+
+    block_id: str
+    status: str
+    submit: SubmitResult | None
+    connected: tuple[str, ...]
+    invalidated: tuple[str, ...]
+    evicted: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class _PendingEntry:
+    block: Block
+    seq: int  # 显式接收序（单调递增）
 
 
 @dataclass(slots=True)
@@ -252,6 +285,51 @@ def _apply_block_to_state(
     state.commit(work_state)
 
 
+def _validate_block_structure(block: Block) -> None:
+    """不依赖 UTXO 的区块结构校验（孤块入缓冲前的唯一验证）。
+
+    只检查不查账本状态即可确定性判定的内容：coinbase 位置与数量、
+    块内交易 ID 重复、同一交易内输入重复。金额守恒、双花、锁定高度等
+    依赖祖先状态的检查留待接入时进行。
+    """
+    seen_tx_ids: set[str] = set()
+    coinbase_seen = False
+    for index, tx in enumerate(block.transactions):
+        if tx.tx_id in seen_tx_ids:
+            raise _ve(
+                "duplicate-txid",
+                "transaction id appears more than once within the block",
+                block=block, tx=tx,
+            )
+        seen_tx_ids.add(tx.tx_id)
+        if tx.is_coinbase:
+            if coinbase_seen:
+                raise _ve(
+                    "multiple-coinbase",
+                    "a block contains more than one coinbase transaction",
+                    block=block, tx=tx,
+                )
+            if index != 0:
+                raise _ve(
+                    "coinbase-position",
+                    "a zero-input (coinbase) transaction is only allowed at "
+                    "transaction index 0",
+                    block=block, tx=tx,
+                )
+            coinbase_seen = True
+            continue
+        seen_inputs: set[OutPoint] = set()
+        for txin in tx.inputs:
+            op = txin.outpoint
+            if op in seen_inputs:
+                raise _ve(
+                    "duplicate-input",
+                    "input is spent more than once within the same transaction",
+                    block=block, tx=tx, outpoint=op,
+                )
+            seen_inputs.add(op)
+
+
 class ReorgLedger:
     """有界 UTXO 重组账本。
 
@@ -263,12 +341,16 @@ class ReorgLedger:
     max_blocks:
         任意一条链允许的最大块数（含创世），默认 100。超出抛
         :class:`~reorg_ledger.errors.ChainLimitError`。
+    orphan_capacity:
+        孤块待验证区的最大块数（默认 128）。父块未知的区块仅做结构校验后
+        暂存于此；缓冲满时按显式接收序淘汰最早的整棵待验证子树。
     """
 
     def __init__(
         self,
         subsidy: int = DEFAULT_SUBSIDY,
         max_blocks: int = MAX_CHAIN_BLOCKS,
+        orphan_capacity: int = DEFAULT_ORPHAN_CAPACITY,
     ) -> None:
         if isinstance(subsidy, bool):
             raise InputContractError("subsidy: bool is not accepted as an integer")
@@ -288,11 +370,29 @@ class ReorgLedger:
             raise InputContractError(
                 f"max_blocks: expected value >= 1, got {max_blocks}"
             )
+        if isinstance(orphan_capacity, bool):
+            raise InputContractError(
+                "orphan_capacity: bool is not accepted as an integer"
+            )
+        if not isinstance(orphan_capacity, int):
+            raise InputContractError(
+                f"orphan_capacity: expected int, got "
+                f"{type(orphan_capacity).__name__}"
+            )
+        if orphan_capacity < 1:
+            raise InputContractError(
+                f"orphan_capacity: expected value >= 1, got {orphan_capacity}"
+            )
         self._subsidy = subsidy
         self._max_blocks = max_blocks
+        self._orphan_capacity = orphan_capacity
         self._nodes: dict[str, _Node] = {}
         self._tip_id: str | None = None
         self._state = _UtxoState()
+        self._pending: dict[str, _PendingEntry] = {}
+        self._pending_children: dict[str, set[str]] = {}
+        self._pending_seq = 0
+        self._ancestor_invalid: set[str] = set()
 
     # ------------------------------------------------------------------ 查询
 
@@ -303,6 +403,31 @@ class ReorgLedger:
     @property
     def max_blocks(self) -> int:
         return self._max_blocks
+
+    @property
+    def orphan_capacity(self) -> int:
+        return self._orphan_capacity
+
+    @property
+    def pending_count(self) -> int:
+        """待验证区中暂存的孤块数量。"""
+        return len(self._pending)
+
+    def pending_orphans(self) -> tuple[str, ...]:
+        """待验证区中的块 ID，按显式接收序排列。"""
+        return tuple(
+            bid for bid, _ in sorted(
+                self._pending.items(), key=lambda kv: kv[1].seq
+            )
+        )
+
+    def orphan_status(self, block_id: str) -> str | None:
+        """孤块状态：``"pending"`` / ``"ancestor_invalid"`` / ``None``（非孤块）。"""
+        if block_id in self._pending:
+            return "pending"
+        if block_id in self._ancestor_invalid:
+            return "ancestor_invalid"
+        return None
 
     @property
     def is_empty(self) -> bool:
@@ -385,12 +510,22 @@ class ReorgLedger:
                     "genesis already exists",
                     block=block,
                 )
-            parent_node = None
         else:
-            parent_node = self._nodes.get(block.parent_id)
-            if parent_node is None:
+            if block.parent_id not in self._nodes:
                 raise OrphanBlockError(block.block_id, block.parent_id)
 
+        return self._connect(block)
+
+    def _connect(self, block: Block) -> SubmitResult:
+        """把父块已在树中的区块验证并接入区块树（``submit`` 的核心段）。
+
+        调用方须保证：区块 ID 未占用、父块存在（或创世情形已判定）。
+        失败抛异常且引擎状态零变更；成功时按需原子重组。
+        """
+        parent_node = (
+            None if block.parent_id is None
+            else self._nodes[block.parent_id]
+        )
         height = 1 if parent_node is None else parent_node.height + 1
         if height > self._max_blocks:
             # 预算/有界性拒绝：不做“合法与否”的判定，与证伪严格分开。
@@ -456,6 +591,174 @@ class ReorgLedger:
             reorganized=reorg is not None,
             reorg=reorg,
         )
+
+    # ------------------------------------------------------------ 孤块缓冲
+
+    def receive(self, block: Block) -> ReceiveResult:
+        """接收一个区块（带孤块缓冲语义）。
+
+        与 :meth:`submit` 的区别：父块未知时不抛
+        :class:`OrphanBlockError`，而是只做不依赖 UTXO 的结构校验，然后把
+        区块放入有上限的待验证区——暂存期间**不计入累计 work 候选、不应用
+        任何交易**。父块到达并验证成功后，按块 ID 字典序递归处理可接入的
+        缓冲后代。父块（或任一祖先）被证伪时，其缓冲后代标记为
+        ``ancestor_invalid``，即使其自身交易单独看起来合法也**不会**接入。
+
+        * 同 ID 同内容重复接收 → 幂等，返回 ``status="duplicate"``；
+        * 同 ID 异内容 → :class:`~reorg_ledger.errors.ConflictingBlockError`；
+        * 缓冲满 → 按显式接收序淘汰最早的整棵待验证子树，淘汰 ID 经
+          ``ReceiveResult.evicted`` 返回；已验证的主链与侧链不受影响。
+
+        任何失败都不会造成部分变更。
+        """
+        if not isinstance(block, Block):
+            raise InputContractError(
+                f"receive: expected Block, got {type(block).__name__}"
+            )
+
+        # --- 幂等 / 冲突：已接入、已缓冲、已标记三种既往记录 ---
+        existing = self._nodes.get(block.block_id)
+        if existing is not None:
+            if existing.block == block:
+                return ReceiveResult(
+                    block.block_id, "duplicate", None, (), (), ()
+                )
+            raise ConflictingBlockError(block.block_id)
+        pending_entry = self._pending.get(block.block_id)
+        if pending_entry is not None:
+            if pending_entry.block == block:
+                return ReceiveResult(
+                    block.block_id, "duplicate", None, (), (), ()
+                )
+            raise ConflictingBlockError(block.block_id)
+        if block.block_id in self._ancestor_invalid:
+            return ReceiveResult(
+                block.block_id, "ancestor_invalid", None, (), (), ()
+            )
+
+        # --- 不依赖 UTXO 的结构校验（入缓冲前唯一一道验证） ---
+        _validate_block_structure(block)
+
+        if block.parent_id is None:
+            if self._nodes:
+                raise _ve(
+                    "multiple-genesis",
+                    "a parent-less block can only be the first (genesis) block; "
+                    "genesis already exists",
+                    block=block,
+                )
+            result = self._connect(block)
+            connected, invalidated = self._drain_pending()
+            return ReceiveResult(
+                block.block_id, "connected", result,
+                (block.block_id,) + connected, invalidated, (),
+            )
+
+        if block.parent_id in self._ancestor_invalid:
+            # 祖先已被证伪：直接标记，不入缓冲、不验证交易。
+            self._ancestor_invalid.add(block.block_id)
+            return ReceiveResult(
+                block.block_id, "ancestor_invalid", None, (), (), ()
+            )
+
+        if block.parent_id in self._nodes:
+            try:
+                result = self._connect(block)
+            except (BlockValidationError, ChainLimitError):
+                # 父块/本块被证伪（或超预算）：其缓冲后代标 ancestor_invalid。
+                self._mark_descendants_invalid(block.block_id)
+                raise
+            connected, invalidated = self._drain_pending()
+            return ReceiveResult(
+                block.block_id, "connected", result,
+                (block.block_id,) + connected, invalidated, (),
+            )
+
+        # --- 父块未知：入待验证区 ---
+        evicted: list[str] = []
+        while len(self._pending) >= self._orphan_capacity:
+            evicted.extend(self._evict_oldest_subtree())
+        self._pending_seq += 1
+        self._pending[block.block_id] = _PendingEntry(block, self._pending_seq)
+        self._pending_children.setdefault(block.parent_id, set()).add(
+            block.block_id
+        )
+        return ReceiveResult(
+            block.block_id, "buffered", None, (), (), tuple(evicted)
+        )
+
+    def _drain_pending(self) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """递归处理可接入的缓冲后代（按块 ID 字典序），返回 (接入ID, 标记ID)。
+
+        每个后代在与 ``submit`` 相同的祖先状态验证下接入；验证失败（证伪或
+        超预算）的块及其全部缓冲后代标记为 ``ancestor_invalid``，不中断其余
+        无关节点的处理。
+        """
+        connected: list[str] = []
+        invalidated: list[str] = []
+        while True:
+            ready = [
+                bid for bid, entry in self._pending.items()
+                if entry.block.parent_id in self._nodes
+            ]
+            if not ready:
+                return tuple(connected), tuple(invalidated)
+            for bid in sorted(ready):
+                entry = self._pending.pop(bid)
+                self._pending_children.get(entry.block.parent_id, set()).discard(
+                    bid
+                )
+                try:
+                    self._connect(entry.block)
+                except (BlockValidationError, ChainLimitError):
+                    invalidated.append(bid)
+                    self._ancestor_invalid.add(bid)
+                    invalidated.extend(self._mark_descendants_invalid(bid))
+                else:
+                    connected.append(bid)
+
+    def _mark_descendants_invalid(self, root_id: str) -> list[str]:
+        """把 ``root_id`` 的全部缓冲后代标记为 ``ancestor_invalid`` 并移出缓冲。"""
+        invalidated: list[str] = []
+        stack = sorted(self._pending_children.get(root_id, ()))
+        while stack:
+            bid = stack.pop()
+            entry = self._pending.pop(bid, None)
+            if entry is None:
+                continue
+            self._pending_children.get(entry.block.parent_id, set()).discard(bid)
+            self._ancestor_invalid.add(bid)
+            invalidated.append(bid)
+            stack.extend(sorted(self._pending_children.get(bid, ())))
+        return invalidated
+
+    def _evict_oldest_subtree(self) -> list[str]:
+        """淘汰显式接收序最早的整棵待验证子树，返回被淘汰的块 ID。
+
+        子树根 = 接收序最早的待验证块沿父链向上（仍在待验证区内）的最高块；
+        淘汰只影响待验证区，不触碰已验证的主链与侧链。
+        """
+        oldest_id = min(
+            self._pending, key=lambda bid: self._pending[bid].seq
+        )
+        root_id = oldest_id
+        while True:
+            parent_id = self._pending[root_id].block.parent_id
+            if parent_id is None or parent_id not in self._pending:
+                break
+            root_id = parent_id
+        evicted: list[tuple[int, str]] = []
+        stack = [root_id]
+        while stack:
+            bid = stack.pop()
+            entry = self._pending.pop(bid, None)
+            if entry is None:
+                continue
+            self._pending_children.get(entry.block.parent_id, set()).discard(bid)
+            evicted.append((entry.seq, bid))
+            stack.extend(sorted(self._pending_children.get(bid, ())))
+        evicted.sort()
+        return [bid for _, bid in evicted]
 
     # -------------------------------------------------------------- 内部工具
 
