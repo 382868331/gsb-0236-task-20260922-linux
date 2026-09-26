@@ -28,13 +28,14 @@ from .errors import (
     LedgerStateError,
     OrphanBlockError,
 )
-from .models import Block, OutPoint, Transaction, UTXO
+from .models import AuthGrant, Block, OutPoint, Transaction, UTXO
 
 __all__ = [
     "DEFAULT_SUBSIDY",
     "MAX_CHAIN_BLOCKS",
     "ReorgPath",
     "SubmitResult",
+    "AssetAudit",
     "ReorgLedger",
 ]
 
@@ -75,6 +76,28 @@ class SubmitResult:
     became_tip: bool
     reorganized: bool
     reorg: ReorgPath | None
+
+
+@dataclass(frozen=True, slots=True)
+class AssetAudit:
+    """单种资产的独立核对结果（由 asset_audit 从交易历史与当前 UTXO 重算）。
+
+    * ``issued``              —— 活跃链历史上累计铸出的数量；
+    * ``burned``              —— 活跃链历史上累计显式销毁的数量；
+    * ``outstanding``         —— issued - burned（理论在外数量）；
+    * ``utxo_total``          —— 当前 UTXO 集合中该资产的实际总量；
+    * ``remaining_allowance`` —— 当前未消费授权 UTXO 的剩余额度合计。
+
+    守恒不变量：``outstanding == utxo_total``（asset_audit 发现不等会抛
+    LedgerStateError，正常路径不会触发）。
+    """
+
+    asset_id: str
+    issued: int
+    burned: int
+    outstanding: int
+    utxo_total: int
+    remaining_allowance: int
 
 
 @dataclass(slots=True)
@@ -147,6 +170,8 @@ def _apply_block_to_state(
     work_state = state.copy()
     total_fees = 0
     coinbase: Transaction | None = None
+    issued: dict[str, int] = {}
+    burned: dict[str, int] = {}
 
     for index, tx in enumerate(block.transactions):
         if tx.tx_id in work_state.applied_tx_ids:
@@ -183,10 +208,12 @@ def _apply_block_to_state(
             work_state.applied_tx_ids.add(tx.tx_id)
             continue
 
-        # --- 普通交易：输入唯一性 / 存在性 / 锁定高度 / 金额守恒 ---
+        # --- 普通交易：输入唯一性 / 存在性 / 锁定高度 / 金额与资产守恒 ---
         seen: set[OutPoint] = set()
         input_sum = 0
         resolved: list[OutPoint] = []
+        input_assets: dict[str, int] = {}
+        grants: list[AuthGrant] = []
         for txin in tx.inputs:
             op = txin.outpoint
             if op in seen:
@@ -213,6 +240,19 @@ def _apply_block_to_state(
                 )
             input_sum += utxo.amount
             resolved.append(op)
+            for asset_id, asset_amount in utxo.assets.items():
+                input_assets[asset_id] = (
+                    input_assets.get(asset_id, 0) + asset_amount
+                )
+            if utxo.auth is not None:
+                grants.append(utxo.auth)
+
+        if len(grants) > 1:
+            raise _ve(
+                "multiple-auth-inputs",
+                "a transaction consumes more than one issuance authorization",
+                block=block, height=height, tx=tx,
+            )
 
         output_sum = sum(o.amount for o in tx.outputs)
         if output_sum > input_sum:
@@ -222,6 +262,95 @@ def _apply_block_to_state(
                 block=block, height=height, tx=tx,
             )
         total_fees += input_sum - output_sum
+
+        # --- 资产与发行授权：每种资产单独守恒，销毁须显式声明 ---
+        output_assets: dict[str, int] = {}
+        auth_out_indices: list[int] = []
+        for out_index, out in enumerate(tx.outputs):
+            for asset_id, asset_amount in out.assets.items():
+                output_assets[asset_id] = (
+                    output_assets.get(asset_id, 0) + asset_amount
+                )
+            if out.auth_allowance is not None:
+                auth_out_indices.append(out_index)
+        if len(auth_out_indices) > 1:
+            raise _ve(
+                "multiple-auth-outputs",
+                "a transaction creates more than one authorization output "
+                "(an authorization cannot be duplicated)",
+                block=block, height=height, tx=tx,
+            )
+
+        minted: dict[str, int] = {}
+        successor: AuthGrant | None = None
+        if grants:
+            grant = grants[0]
+            successor_remaining = (
+                tx.outputs[auth_out_indices[0]].auth_allowance
+                if auth_out_indices else 0
+            )
+            assert successor_remaining is not None
+            if successor_remaining > grant.remaining:
+                raise _ve(
+                    "auth-allowance-exceeded",
+                    f"successor allowance {successor_remaining} exceeds the "
+                    f"consumed authorization's remaining {grant.remaining}",
+                    block=block, height=height, tx=tx,
+                )
+            minted[grant.asset_id] = grant.remaining - successor_remaining
+            if auth_out_indices:
+                successor = AuthGrant(grant.asset_id, successor_remaining)
+        elif auth_out_indices:
+            # 创设交易：从普通基础币输入建立新授权；资产 ID 由“创设交易
+            # 完整 ID + 输出位置”派生，不能指定他人的 asset_id。
+            created_index = auth_out_indices[0]
+            created_allowance = tx.outputs[created_index].auth_allowance
+            assert created_allowance is not None
+            successor = AuthGrant(f"{tx.tx_id}:{created_index}", created_allowance)
+
+        for asset_id in (
+            set(input_assets) | set(output_assets) | set(tx.burns) | set(minted)
+        ):
+            available = input_assets.get(asset_id, 0) + minted.get(asset_id, 0)
+            demanded = output_assets.get(asset_id, 0) + tx.burns.get(asset_id, 0)
+            if demanded > available:
+                if grants and asset_id == grants[0].asset_id:
+                    raise _ve(
+                        "auth-allowance-exceeded",
+                        f"minting more of asset {asset_id!r} than the "
+                        f"authorization allows (minted + successor remaining "
+                        f"must equal the consumed remaining allowance)",
+                        block=block, height=height, tx=tx,
+                    )
+                raise _ve(
+                    "unauthorized-mint",
+                    f"transaction creates asset {asset_id!r} without "
+                    f"consuming its issuance authorization",
+                    block=block, height=height, tx=tx,
+                )
+            if demanded < available:
+                if grants and asset_id == grants[0].asset_id:
+                    raise _ve(
+                        "issuance-mismatch",
+                        f"for asset {asset_id!r}: minted amount + successor "
+                        f"remaining must equal the consumed allowance "
+                        f"(outputs+burns account for {demanded}, "
+                        f"inputs+minting provide {available})",
+                        block=block, height=height, tx=tx,
+                    )
+                raise _ve(
+                    "implicit-burn",
+                    f"asset {asset_id!r} shrinks by {available - demanded} "
+                    f"without an explicit burns declaration",
+                    block=block, height=height, tx=tx,
+                )
+
+        for asset_id, mint_amount in minted.items():
+            if mint_amount:
+                issued[asset_id] = issued.get(asset_id, 0) + mint_amount
+        for asset_id, burn_amount in tx.burns.items():
+            if burn_amount:
+                burned[asset_id] = burned.get(asset_id, 0) + burn_amount
 
         # --- 提交该交易：移除输入、新增输出（严格按序，后者可花前者输出） ---
         for op in resolved:
@@ -235,7 +364,15 @@ def _apply_block_to_state(
                     "(transaction id reused on this chain)",
                     block=block, height=height, tx=tx, outpoint=op,
                 )
-            work_state.utxos[op] = UTXO(out.amount, out.lock_height)
+            out_grant = (
+                successor
+                if successor is not None and auth_out_indices
+                and out_index == auth_out_indices[0]
+                else None
+            )
+            work_state.utxos[op] = UTXO(
+                out.amount, out.lock_height, out.assets, out_grant
+            )
         work_state.applied_tx_ids.add(tx.tx_id)
 
     if coinbase is not None:

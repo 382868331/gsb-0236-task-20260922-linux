@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Iterable
+from types import MappingProxyType
+from typing import Iterable, Mapping
 
 from .errors import InputContractError, NonFiniteNumberError
 
@@ -23,6 +24,7 @@ __all__ = [
     "TxInput",
     "TxOutput",
     "UTXO",
+    "AuthGrant",
     "Transaction",
     "Block",
 ]
@@ -74,6 +76,26 @@ def _check_seq(value: object, path: str) -> list:
     return list(value)
 
 
+def _check_asset_map(value: object, path: str) -> Mapping[str, int]:
+    """资产映射入口契约：None 视为空；否则须为 {非空字符串: 非负整数}。
+
+    返回只读映射（MappingProxyType），保证数据类真正不可变。
+    """
+    if value is None:
+        return MappingProxyType({})
+    if not isinstance(value, Mapping):
+        raise InputContractError(
+            f"{path}: expected a mapping of asset_id -> amount, "
+            f"got {type(value).__name__}"
+        )
+    normalized: dict[str, int] = {}
+    for key, amount in value.items():
+        _check_str(key, f"{path} key")
+        _check_int(amount, f"{path}[{key!r}]", min_value=0)
+        normalized[key] = amount
+    return MappingProxyType(normalized)
+
+
 @dataclass(frozen=True, slots=True)
 class OutPoint:
     """UTXO 的全局定位：创建它的交易 ID + 输出下标（从 0 开始）。"""
@@ -107,27 +129,71 @@ class TxInput:
 
 @dataclass(frozen=True, slots=True)
 class TxOutput:
-    """交易输出：正整数金额 + 锁定高度（``lock_height`` 之前不可花费）。"""
+    """交易输出：正整数基础币金额 + 锁定高度（``lock_height`` 之前不可花费）。
+
+    可选扩展（缺省即旧行为）：
+
+    * ``assets`` —— 该输出携带的 {资产 ID: 非负整数数量} 映射；
+    * ``auth_allowance`` —— 若非 None，本输出同时是一个**发行授权输出**，
+      数值为授权剩余额度。授权对应的资产 ID 不由输出指定：
+      创设时由“创设交易 ID:输出下标”派生，发行时继承被消费授权的
+      资产 ID（见 engine 的协议语义）。
+    """
 
     amount: int
     lock_height: int
+    assets: Mapping[str, int] | None = None
+    auth_allowance: int | None = None
 
     def __post_init__(self) -> None:
         _check_int(self.amount, "TxOutput.amount", min_value=1)
         _check_int(self.lock_height, "TxOutput.lock_height", min_value=0)
+        object.__setattr__(
+            self, "assets", _check_asset_map(self.assets, "TxOutput.assets")
+        )
+        if self.auth_allowance is not None:
+            _check_int(
+                self.auth_allowance, "TxOutput.auth_allowance", min_value=0
+            )
 
 
-# UTXO 在账本状态里与 TxOutput 同构（金额 + 锁定高度）。
+@dataclass(frozen=True, slots=True)
+class AuthGrant:
+    """发行授权：携带资产 ID 与剩余额度，附在某个 UTXO 上。
+
+    资产 ID 在创设时由“创设交易 ID:输出下标”唯一派生，调用方无法
+    指定别人的资产 ID；发行（铸造）必须消费携带该授权的 UTXO。
+    """
+
+    asset_id: str
+    remaining: int
+
+    def __post_init__(self) -> None:
+        _check_str(self.asset_id, "AuthGrant.asset_id")
+        _check_int(self.remaining, "AuthGrant.remaining", min_value=0)
+
+
+# UTXO 在账本状态里与 TxOutput 同构（金额 + 锁定高度 + 资产 + 授权）。
 @dataclass(frozen=True, slots=True)
 class UTXO:
-    """未花费输出：金额与锁定高度。"""
+    """未花费输出：基础币金额、锁定高度、携带资产与可选发行授权。"""
 
     amount: int
     lock_height: int
+    assets: Mapping[str, int] | None = None
+    auth: AuthGrant | None = None
 
     def __post_init__(self) -> None:
         _check_int(self.amount, "UTXO.amount", min_value=1)
         _check_int(self.lock_height, "UTXO.lock_height", min_value=0)
+        object.__setattr__(
+            self, "assets", _check_asset_map(self.assets, "UTXO.assets")
+        )
+        if self.auth is not None and not isinstance(self.auth, AuthGrant):
+            raise InputContractError(
+                f"UTXO.auth: expected AuthGrant or None, "
+                f"got {type(self.auth).__name__}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,11 +203,15 @@ class Transaction:
     * ``inputs`` 为空即 **coinbase 交易**（铸币交易）；非空即为普通交易。
     * 同一交易内输入是否重复，属于协议语义，由引擎验证（可定位的
       ``duplicate-input`` 拒绝），不在构造时静默处理。
+    * ``burns``（可选）—— 显式声明的资产销毁量 {asset_id: 非负整数}。
+      资产每种单独守恒：输入携带量 + 本交易铸出量 = 输出携带量 +
+      声明销毁量；不声明即不允许减少（隐式销毁会被拒绝）。
     """
 
     tx_id: str
     inputs: tuple[TxInput, ...]
     outputs: tuple[TxOutput, ...]
+    burns: Mapping[str, int] | None = None
 
     def __post_init__(self) -> None:
         _check_str(self.tx_id, "Transaction.tx_id")
@@ -170,6 +240,10 @@ class Transaction:
             )
         object.__setattr__(self, "inputs", tuple(inputs))
         object.__setattr__(self, "outputs", tuple(outputs))
+        object.__setattr__(
+            self, "burns",
+            _check_asset_map(self.burns, f"Transaction {self.tx_id!r} burns"),
+        )
 
     @property
     def is_coinbase(self) -> bool:
