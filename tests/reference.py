@@ -9,8 +9,9 @@
 * :class:`ReferenceReject` —— 链中某块被确定性证伪（带 reason 短码）；
 * :class:`ReferenceLimit`  —— 超过调用方给定的块数预算（不判合法性）。
 
-返回的 UTXO 以 ``{OutPoint: (amount, lock_height)}`` 纯字典表示，避免与引擎的
-``UTXO`` 状态对象产生结构耦合。
+返回的 UTXO 以 ``{OutPoint: (amount, lock_height, created_height)}`` 纯字典
+表示，避免与引擎的 ``UTXO`` 状态对象产生结构耦合。创建高度由本参考在顺序
+重放时按当前区块高度**独立**记账，不从引擎读取。
 """
 
 from __future__ import annotations
@@ -41,7 +42,7 @@ def replay(
     subsidy: int = 50,
     *,
     max_blocks: int | None = None,
-) -> dict[OutPoint, tuple[int, int]]:
+) -> dict[OutPoint, tuple[int, int, int]]:
     """从创世重放一条链，返回 tip 处 UTXO 集合。
 
     任何区块非法都抛 :class:`ReferenceReject`；``max_blocks`` 给定时超长抛
@@ -101,7 +102,7 @@ def replay(
                         raise ReferenceReject(
                             "duplicate-txid", f"coinbase output collision at {op}"
                         )
-                    new_utxos[op] = (out.amount, out.lock_height)
+                    new_utxos[op] = (out.amount, out.lock_height, height)
                 spent_history.add(tx.tx_id)
                 continue
 
@@ -122,12 +123,22 @@ def replay(
                         "missing-input",
                         f"tx {tx.tx_id!r} spends unknown/spent output {op}",
                     )
-                amount, lock = coin
+                amount, lock, created_height = coin
                 if lock > height:
                     raise ReferenceReject(
                         "output-locked",
                         f"tx {tx.tx_id!r} spends {op} locked until {lock} "
                         f"at height {height}",
+                    )
+                required_height = created_height + tin.min_age
+                if height < required_height:
+                    raise ReferenceReject(
+                        "output-too-young",
+                        f"tx {tx.tx_id!r} spends {op} requiring age "
+                        f"{tin.min_age} from height {created_height}; "
+                        f"needs height {required_height}, block is "
+                        f"height {height} "
+                        f"({required_height - height} block(s) short)",
                     )
                 in_sum += amount
                 consumed.append(op)
@@ -150,7 +161,7 @@ def replay(
                     raise ReferenceReject(
                         "duplicate-txid", f"output point collision at {op}"
                     )
-                new_utxos[op] = (out.amount, out.lock_height)
+                new_utxos[op] = (out.amount, out.lock_height, height)
             spent_history.add(tx.tx_id)
 
         if coinbase is not None:

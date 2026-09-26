@@ -5,9 +5,10 @@
 * **入口契约校验**只在本文件做：类型、``int`` 纯度（拒绝 ``bool`` / 浮点 /
   NaN / Infinity）、正数/非空等接口层面的要求，违反时抛
   :class:`~reorg_ledger.errors.InputContractError`。
-* **协议语义校验**（双花、锁定高度、coinbase 超额、输入输出金额关系、
-  区块内重复交易、coinbase 位置等）不在数据类里做——它们是“区块在祖先状态下
-  被证伪”，由引擎抛 :class:`~reorg_ledger.errors.BlockValidationError`。
+* **协议语义校验**（双花、绝对锁定高度、输入相对年龄 ``min_age``、coinbase
+  超额、输入输出金额关系、区块内重复交易、coinbase 位置等）不在数据类里做
+  ——它们是“区块在祖先状态下被证伪”，由引擎抛
+  :class:`~reorg_ledger.errors.BlockValidationError`。
 """
 
 from __future__ import annotations
@@ -91,10 +92,16 @@ class OutPoint:
 
 @dataclass(frozen=True, slots=True)
 class TxInput:
-    """交易输入：指向一个未花费输出。"""
+    """交易输入：指向一个未花费输出。
+
+    ``min_age`` 是**相对年龄要求**（非负整数，默认 0）：被引用输出必须在
+    至少 ``创建区块高度 + min_age`` 的区块里才能被花费。``0`` 允许同块按
+    依赖顺序消费新输出。
+    """
 
     prev_tx: str
     prev_index: int
+    min_age: int = 0
 
     @property
     def outpoint(self) -> OutPoint:
@@ -103,6 +110,7 @@ class TxInput:
     def __post_init__(self) -> None:
         _check_str(self.prev_tx, "TxInput.prev_tx")
         _check_int(self.prev_index, "TxInput.prev_index", min_value=0)
+        _check_int(self.min_age, "TxInput.min_age", min_value=0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,14 +128,21 @@ class TxOutput:
 # UTXO 在账本状态里与 TxOutput 同构（金额 + 锁定高度）。
 @dataclass(frozen=True, slots=True)
 class UTXO:
-    """未花费输出：金额与锁定高度。"""
+    """未花费输出：金额、绝对锁定高度与创建区块高度。
+
+    ``created_height`` 由引擎在应用输出所在交易时按**当前重放链**的区块
+    高度写入；重组重放会重新推导，绝不会沿用其他分支上的高度。直接构造
+    时缺省为 0（兼容旧的双字段构造方式，引擎从不产生该缺省值）。
+    """
 
     amount: int
     lock_height: int
+    created_height: int = 0
 
     def __post_init__(self) -> None:
         _check_int(self.amount, "UTXO.amount", min_value=1)
         _check_int(self.lock_height, "UTXO.lock_height", min_value=0)
+        _check_int(self.created_height, "UTXO.created_height", min_value=0)
 
 
 @dataclass(frozen=True, slots=True)

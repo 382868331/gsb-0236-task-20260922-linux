@@ -14,6 +14,11 @@
    （被证明非法）。
 
 引擎内全部金额运算均为任意精度整数，不使用浮点。
+
+相对高度年龄（本轮新增）：UTXO 在写入状态时记录其**创建区块高度**；交易输入
+可带非负 ``min_age``，仅当 ``候选块高度 >= 创建高度 + min_age`` 时可花费。
+因为创建高度总是在“沿当前链重放”时写入，重组重放天然把它恢复为新链上的
+高度，不会沿用另一分支的值。
 """
 
 from __future__ import annotations
@@ -117,6 +122,7 @@ def _ve(
     height: int | None = None,
     tx: Transaction | None = None,
     outpoint: OutPoint | None = None,
+    blocks_short: int | None = None,
 ) -> BlockValidationError:
     return BlockValidationError(
         reason,
@@ -125,6 +131,7 @@ def _ve(
         height=height,
         tx_id=tx.tx_id if tx is not None else None,
         outpoint=outpoint,
+        blocks_short=blocks_short,
     )
 
 
@@ -139,7 +146,8 @@ def _apply_block_to_state(
     语义：
 
     * coinbase（零输入交易）必须位于索引 0 且至多一笔；其输出在索引 0 处
-      即刻入账，因此同块后续交易可按序花费（仍受锁定高度约束）。
+      即刻以本块高度为创建高度入账，因此同块后续交易可按序花费（仍受绝对
+      锁定高度与输入相对年龄约束）。
     * coinbase 的铸币上限 ``subsidy + 手续费`` 在块末结算；超额则整块回滚。
     * 失败时 ``state`` 不被部分修改（所有写入先发生在副本上）。
     """
@@ -179,7 +187,7 @@ def _apply_block_to_state(
                         "coinbase output point collides with an existing UTXO",
                         block=block, height=height, tx=tx, outpoint=op,
                     )
-                work_state.utxos[op] = UTXO(out.amount, out.lock_height)
+                work_state.utxos[op] = UTXO(out.amount, out.lock_height, height)
             work_state.applied_tx_ids.add(tx.tx_id)
             continue
 
@@ -211,6 +219,19 @@ def _apply_block_to_state(
                     f"spent at height {height}",
                     block=block, height=height, tx=tx, outpoint=op,
                 )
+            required_height = utxo.created_height + txin.min_age
+            if height < required_height:
+                blocks_short = required_height - height
+                raise _ve(
+                    "output-too-young",
+                    f"input requires {txin.min_age} blocks of relative age "
+                    f"after creation height {utxo.created_height}; output is "
+                    f"spendable at height {required_height}, but the "
+                    f"candidate block is height {height} ({blocks_short} "
+                    f"block(s) short)",
+                    block=block, height=height, tx=tx, outpoint=op,
+                    blocks_short=blocks_short,
+                )
             input_sum += utxo.amount
             resolved.append(op)
 
@@ -235,7 +256,7 @@ def _apply_block_to_state(
                     "(transaction id reused on this chain)",
                     block=block, height=height, tx=tx, outpoint=op,
                 )
-            work_state.utxos[op] = UTXO(out.amount, out.lock_height)
+            work_state.utxos[op] = UTXO(out.amount, out.lock_height, height)
         work_state.applied_tx_ids.add(tx.tx_id)
 
     if coinbase is not None:

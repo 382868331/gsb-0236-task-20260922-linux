@@ -9,7 +9,8 @@
 * :class:`NonFiniteNumberError` —— 数值输入为 NaN / Infinity（本模块只接受整数，
   浮点一律拒绝；非有限浮点单独给出明确错误，而不是淹没在类型错误里）。
 * :class:`BlockValidationError` —— **证明无解**：区块在其祖先状态上被确定性地证伪
-  （双花、超额 coinbase、锁定高度不足、输出超过输入等），带块/交易/OutPoint 定位。
+  （双花、超额 coinbase、锁定高度不足、相对年龄不足、输出超过输入等），带块/
+  交易/OutPoint 定位；``output-too-young`` 另带 ``blocks_short``（还差几块）。
 * :class:`OrphanBlockError`     —— 既不能证明合法也不能证明非法：父块缺失。
 * :class:`ChainLimitError`      —— **搜索/处理预算耗尽**：链长超过 100 块的接口
   上限，与“区块被证明非法”严格区分。
@@ -86,6 +87,7 @@ class BlockValidationError(LedgerError):
         height: int | None = None,
         tx_id: str | None = None,
         outpoint: object | None = None,
+        blocks_short: int | None = None,
     ) -> None:
         loc = []
         if block_id is not None:
@@ -104,3 +106,5 @@ class BlockValidationError(LedgerError):
         self.height = height
         self.tx_id = tx_id
         self.outpoint = outpoint
+        # output-too-young 专用：输入还需要多少个区块才满足相对年龄要求。
+        self.blocks_short = blocks_short

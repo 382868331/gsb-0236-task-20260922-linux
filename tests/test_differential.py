@@ -27,17 +27,19 @@ SUBSIDY = 50
 
 
 class _Coin:
-    __slots__ = ("tx_id", "index", "amount", "lock_height")
+    __slots__ = ("tx_id", "index", "amount", "lock_height",
+                 "created_height")
 
     def __init__(self, tx_id: str, index: int, amount: int,
-                 lock_height: int) -> None:
+                 lock_height: int, created_height: int = 0) -> None:
         self.tx_id = tx_id
         self.index = index
         self.amount = amount
         self.lock_height = lock_height
+        self.created_height = created_height
 
-    def as_input(self) -> TxInput:
-        return TxInput(self.tx_id, self.index)
+    def as_input(self, min_age: int = 0) -> TxInput:
+        return TxInput(self.tx_id, self.index, min_age)
 
 
 class _Builder:
@@ -62,7 +64,9 @@ class _Builder:
         self.blocks[g.block_id] = g
         self.work_of[g.block_id] = 1
         self.heights[g.block_id] = 1
-        self.wallets[g.block_id] = [_Coin("genesis-cb", 0, SUBSIDY, 1)]
+        self.wallets[g.block_id] = [
+            _Coin("genesis-cb", 0, SUBSIDY, 1, created_height=1)
+        ]
 
     @property
     def genesis_id(self) -> str:
@@ -96,15 +100,26 @@ class _Builder:
             tx_id = self._uid("tx")
             lock = self.rng.choice([0, 0, 0, h])
             outs = (TxOutput(amount, lock),)
-            available.append(_Coin(tx_id, 0, amount, lock))
-            txs.append(Transaction(
-                tx_id, tuple(c.as_input() for c in chosen), outs
-            ))
+            # 独立于引擎决定每枚输入的相对年龄要求；可选值保证本块合法：
+            # 输出至少从高度 h-? 起存在，0 永远可行，同块新输出给 0。
+            tin_list = []
+            for coin in chosen:
+                max_age = h - coin.created_height
+                assert max_age >= 0
+                age = self.rng.choice([0, 0, 0, max_age, max_age // 2])
+                age = max(0, min(age, max_age))
+                tin_list.append(coin.as_input(age))
+            available.append(
+                _Coin(tx_id, 0, amount, lock, created_height=h)
+            )
+            txs.append(Transaction(tx_id, tuple(tin_list), outs))
 
         cb_id = self._uid("cb")
         cb_amount = SUBSIDY + fees_total
         coinbase = Transaction(cb_id, (), (TxOutput(cb_amount, 0),))
-        available.append(_Coin(cb_id, 0, cb_amount, 0))
+        available.append(
+            _Coin(cb_id, 0, cb_amount, 0, created_height=h)
+        )
 
         block_id = self._uid("b")
         blk = Block(block_id, tip, work or self.rng.randint(1, 9),
@@ -222,7 +237,7 @@ class DifferentialTests(unittest.TestCase):
         tip = expected_tip_chain[-1]
         expected_utxos = self._reference_utxos(builder, tip)
         actual = {
-            op: (u.amount, u.lock_height)
+            op: (u.amount, u.lock_height, u.created_height)
             for op, u in ledger.snapshot_utxos().items()
         }
         self.assertEqual(actual, expected_utxos)
@@ -360,7 +375,7 @@ class DifferentialTests(unittest.TestCase):
         self.assertGreaterEqual(events["reorg"], 1)
         self.assertEqual(list(ledger.active_path), builder.chain_ids(s2))
         actual = {
-            op: (u.amount, u.lock_height)
+            op: (u.amount, u.lock_height, u.created_height)
             for op, u in ledger.snapshot_utxos().items()
         }
         self.assertEqual(actual, dict(self._reference_utxos(builder, s2)))
@@ -380,8 +395,11 @@ class DifferentialTests(unittest.TestCase):
         self.assertIsNot(snap1, snap2)
         for op, utxo in snap1.items():
             self.assertIsInstance(op, OutPoint)
-            self.assertEqual((utxo.amount, utxo.lock_height),
-                             (snap2[op].amount, snap2[op].lock_height))
+            self.assertEqual(
+                (utxo.amount, utxo.lock_height, utxo.created_height),
+                (snap2[op].amount, snap2[op].lock_height,
+                 snap2[op].created_height),
+            )
 
 
 if __name__ == "__main__":

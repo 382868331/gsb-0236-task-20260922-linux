@@ -49,6 +49,12 @@ class ModelContractTests(unittest.TestCase):
         with self.assertRaises(InputContractError):
             TxInput("t", -1)
         with self.assertRaises(InputContractError):
+            TxInput("t", 0, -1)      # 相对年龄要求非负
+        with self.assertRaises(InputContractError):
+            TxInput("t", 0, True)    # type: ignore[arg-type]
+        # 默认值为 0（旧两参构造保持兼容）。
+        self.assertEqual(TxInput("t", 0).min_age, 0)
+        with self.assertRaises(InputContractError):
             Transaction("t", (), ())  # 至少一个输出
         with self.assertRaises(InputContractError):
             Block("b", None, 0, (cb("g"),))   # work 必须为正整数

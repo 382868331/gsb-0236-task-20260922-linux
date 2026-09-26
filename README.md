@@ -4,6 +4,10 @@
 累计工作量选链与“撤销旧链 → 应用新链”的原子重组。不验证 PoW，区块 ID 为
 合成唯一字符串。核心、测试、演示全部离线运行，无第三方依赖。
 
+本轮迭代在不改变旧接口默认行为的前提下，为交易输入增加**非负相对高度要求**
+（`TxInput.min_age`）：UTXO 记住创建区块高度，候选块高度达到“创建高度 +
+要求”才可花费；重组时创建高度随 UTXO 按区块历史重建。
+
 ## 运行环境
 
 - Python **3.14.7**（仅依赖标准库；3.10+ 语法即可运行，但以 3.14.7 为准）
@@ -13,10 +17,18 @@
 ## 准确命令
 
 ```bash
-# 必要测试（28 个，含确定性差分测试）
+# 可选：标准库 venv（无需安装任何第三方包）
+python3.14 -m venv .venv
+source .venv/bin/activate
+
+# 必要测试（34 个，含确定性差分测试与相对年龄专项测试）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（真实重组 + 实际触发的拒绝/异常边界，实测 < 0.1 秒）
+# 本轮迭代演示：相对高度年龄要求（差一块/恰好到期/同块链式/重组后年龄缩短）
+# 实测 < 0.1 秒，远在 90 秒预算内；无 sleep、无预录
+python demo_iteration.py
+
+# 上一轮演示（真实重组 + 实际触发的拒绝/异常边界）继续可用
 python demo.py
 ```
 
@@ -33,7 +45,9 @@ tests/
   test_models.py  入口契约测试
   test_engine.py  场景测试
   test_differential.py  固定种子随机树差分测试（参考实现作预言机）
+  test_relative_age.py 相对年龄专项（恰好到期/差一块/同块链式/重组年龄缩短）
 demo.py           固定输入演示
+demo_iteration.py 本轮迭代演示：输入相对高度要求（min_age）
 ```
 
 ## 公开数据结构
@@ -43,9 +57,9 @@ demo.py           固定输入演示
 | 类型 | 字段 | 约束 |
 |---|---|---|
 | `OutPoint` | `tx_id: str`, `index: int` | 非空字符串；`index >= 0` |
-| `TxInput` | `prev_tx: str`, `prev_index: int` | 指向一个 UTXO |
-| `TxOutput` | `amount: int`, `lock_height: int` | `amount >= 1`；`lock_height >= 0` |
-| `UTXO` | `amount: int`, `lock_height: int` | 与输出同构 |
+| `TxInput` | `prev_tx: str`, `prev_index: int`, `min_age: int = 0` | 指向一个 UTXO；`min_age >= 0` 为**非负相对高度要求**，默认 0 |
+| `TxOutput` | `amount: int`, `lock_height: int` | `amount >= 1`；`lock_height >= 0`（绝对高度锁，本轮未改） |
+| `UTXO` | `amount: int`, `lock_height: int`, `created_height: int = 0` | 与输出同构；`created_height` 是输出所在区块高度，由引擎按重放链写入 |
 | `Transaction` | `tx_id: str`, `inputs: tuple[TxInput,...]`, `outputs: tuple[TxOutput,...]` | 至少 1 个输出；`inputs` 为空即 **coinbase** |
 | `Block` | `block_id: str`, `parent_id: str \| None`, `work: int`, `transactions: tuple[Transaction,...]` | `work >= 1`；至少 1 笔交易；不可自为父；`parent_id=None` 表示创世 |
 
@@ -58,6 +72,10 @@ from reorg_ledger import (
 
 ledger = ReorgLedger(subsidy=50, max_blocks=100)
 result = ledger.submit(block)          # 提交区块（见下文错误语义）
+
+# 输入的相对高度要求：输出创建后至少经过 min_age 个区块才可被花费
+# （第三参缺省为 0；0 允许同块按依赖顺序消费新输出）
+aged_input = TxInput("prev-tx-id", 0, 2)
 
 ledger.tip_id          # 当前 tip 区块 ID（空树为 None）
 ledger.tip             # 当前 tip 的 Block
@@ -91,15 +109,38 @@ deactivated, activated)`：
    其中手续费 = Σ(输入金额 − 输出金额)。超额整块拒绝。
 3. **普通交易**：输入在同一交易内不可重复；每个输入必须引用一个存在且未花费
    的输出；输出金额之和 ≤ 输入金额之和。
-4. **锁定高度**：被引用输出的 `lock_height <= 所在块高度` 时方可花费
-   （相等允许，边界即如此定义）。
-5. **交易 ID 唯一**：同一链历史中 `tx_id` 不可复用（含跨块）。
-6. **选链**：累计 `work`（沿父链求和）最大者为活跃链；累计 work 相同取
+4. **锁定高度（绝对，沿用上一轮）**：被引用输出的 `lock_height <= 所在块高度`
+   时方可花费（相等允许，边界即如此定义）。本轮**不**引入任何真实时间或
+   绝对日期锁。
+5. **相对高度要求（本轮新增）**：每个输入可带非负整数 `min_age`（默认 0）。
+   UTXO 记住其**创建区块高度** `created_height`；仅当
+   `候选块高度 >= created_height + min_age` 时该输入可花费（相等即**恰好到期**，
+   允许）。`min_age=0` 允许在同一区块内**按原有区块内顺序**消费新输出
+   （coinbase 输出与普通交易输出都在交易提交时即刻带创建高度入账）；
+   `min_age>=1` 的新输出不能在同块被花。一个输出在内存里/别的祖先下可花，
+   不代表放进当前高度的候选块合法——年龄一律以**候选块自身高度**判定。
+6. **重组时创建高度按历史重建**：UTXO 的 `created_height` 不是输出携带的
+   静态字段，而是引擎在“从创世沿当前链重放”时按输出所在块高度写入。重组
+   在临时状态上重放整条新链，因此同一输出 ID 若在侧枝的不同高度被创建，
+   切换后其年龄按新链缩短/拉长，**绝不沿用另一分支上的高度**。
+7. **交易 ID 唯一**：同一链历史中 `tx_id` 不可复用（含跨块）。
+8. **选链**：累计 `work`（沿父链求和）最大者为活跃链；累计 work 相同取
    **tip 区块 ID 字典序较小**者。选链结果只取决于区块集合，与提交顺序无关。
-7. **侧枝接收**：区块先在“从创世沿父链重放得到的祖先状态”上验证；通过即
+9. **侧枝接收**：区块先在“从创世沿父链重放得到的祖先状态”上验证；通过即
    入树（即使未成为 tip），未通过则不入树、账本零变更。
-8. **原子重组**：新 tip 产生时，在临时状态上从创世重放整条新链，成功后
+10. **原子重组**：新 tip 产生时，在临时状态上从创世重放整条新链，成功后
    一次性切换 tip 与 UTXO 集合；中途异常保留旧状态（不会留下部分变更）。
+
+### 年龄不足的错误语义
+
+候选块高度小于 `created_height + min_age` 时抛 `BlockValidationError`：
+
+- `reason = "output-too-young"`；
+- `blocks_short` = `created_height + min_age - 候选块高度`（**这个输入还差
+  几块**，差一块时为 1，恰好到期为 0 且不报错）；
+- 同时填充 `block_id` / `height` / `tx_id` / `outpoint` 定位字段；
+- 区块内任何一笔交易年龄不足都使**整块**被拒：已模拟应用的靠前交易（含
+  coinbase 铸币）一并回滚，不留下部分消费。
 
 ## 输入上限
 
@@ -127,6 +168,7 @@ deactivated, activated)`：
   有限浮点给 `InputContractError`。
 - **`BlockValidationError.reason` 稳定短码**：`duplicate-input`、
   `missing-input`、`output-locked`、`output-exceeds-input`、
+  `output-too-young`（相对年龄不足，附 `blocks_short`）、
   `coinbase-overflow`、`coinbase-position`、`multiple-coinbase`、
   `duplicate-txid`、`multiple-genesis`。
 - 失败的 `submit` 不产生未说明的部分变更：区块不入树、tip/UTXO/活跃路径
@@ -142,7 +184,11 @@ deactivated, activated)`：
 - **UTXO 集以 dict 全量快照切换**：重组提交是一次引用替换，旧链状态不残留。
 - **侧枝保留**：通过祖先验证的非活跃块留在树中，之后可在其上接续更强链
   触发重组；非法块从不入树。
-- **锁定时间只实现绝对高度**一种形式；不支持时间戳、相对锁、脚本/签名。
+- **锁定语义有两种且正交**：输出上的绝对 `lock_height`（沿用上一轮）与
+  输入上的非负相对 `min_age`（本轮新增）；不支持时间戳/真实时间/日期锁、
+  脚本/签名。
+- **创建高度不持久化在交易数据里**：`TxOutput` 不含创建高度；UTXO 的
+  `created_height` 完全由重放过程推导，天然满足“重组按历史恢复”。
 - **金额单位无小数**：整数最小单位，全链路无浮点，因此**不存在浮点误差口径**
   ——所有余额/手续费比较都是精确整数比较。
 
@@ -159,6 +205,24 @@ deactivated, activated)`：
   恰好等于补贴+手续费的通过边界）、锁定高度（`lock == height` 可花、
   `lock > height` 拒绝）、无效侧枝不入树且不污染主链、孤儿块、重复块、
   同分字典序决胜、真实重组与重组回旧链、100 块界、失败原子性、入口契约。
+- 相对年龄专项（`tests/test_relative_age.py`，期望值由独立参考 `replay`
+  独立重建 `created_height` 给出）：恰好到期（`height == created+age`）、
+  差一块（`output-too-young` 且 `blocks_short==1`，含整块回滚零部分消费与
+  “差多块”数量）、同块 `min_age=0` 链式消费（及同块 `min_age=1` 被拒）、
+  重组后创建高度重建导致年龄缩短、内存别处合法不等于当前高度合法、旧两参
+  `TxInput`/`UTXO` 构造与未设相对锁交易的回归行为。固定种子差分夹具也在
+  输入上随机加入非零 `min_age`，扩大与独立参考的交叉比对面。
+
+## demo_iteration.py 输出内容
+
+1. **实际触发的边界**：高度 2 花费创建于高度 1、要求 `min_age=2` 的输出，
+   真实抛出 `BlockValidationError(reason='output-too-young')`，报告
+   `blocks_short=1`，并展示失败块不入树、无部分消费。
+2. **恰好到期**：同一要求在高度 3（`1 + 2 == 3`）成功。
+3. **同块链式**：`min_age=0` 时 coinbase → t1 → t2 → t3 同块按序消费。
+4. **重组后年龄缩短**：同名输出在主链高度 3 创建（高度 4、`min_age=2`
+   差 1 块被拒），侧枝在高度 2 创建并高 work 重组；重组后续块在高度 3 以
+   `min_age=1` 恰好花掉它。
 
 ## demo.py 输出内容
 
@@ -174,7 +238,8 @@ deactivated, activated)`：
 
 - 仅实现本题的有限协议子集：无签名/脚本验证、无时间戳与时间锁、无对等网络、
   无持久化、无内存池/费用市场、无难度调整，**不宣称与任何行业完整协议
-  （Bitcoin 等）兼容**。
+  （Bitcoin 等）兼容**。`min_age` 只是按区块高度计数的相对确认数约束，
+  与 Bitcoin CSV/BIP112 的脚本语义无关；不读取真实时间、无绝对日期锁。
 - 不缓存孤儿块：父块未知直接抛 `OrphanBlockError`，父块到达后需重新提交子块。
 - 不验证 PoW；`work` 是调用方给定的正整数，只用于累计比较。
 - 重放式实现面向 ≤100 块的有界场景；远超该规模时性能不做承诺。

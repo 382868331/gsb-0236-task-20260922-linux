@@ -88,7 +88,7 @@ class BasicChainTests(unittest.TestCase):
             ledger.submit(blk)
         expected = replay([g, a, b])
         actual = {
-            op: (u.amount, u.lock_height)
+            op: (u.amount, u.lock_height, u.created_height)
             for op, u in ledger.snapshot_utxos().items()
         }
         self.assertEqual(actual, dict(expected))
@@ -317,7 +317,8 @@ class ReorgTests(unittest.TestCase):
         self.assertNotIn(OutPoint("cba", 0), utxos)
         self.assertIn(OutPoint("tb", 0), utxos)
         self.assertEqual(
-            {op: (u.amount, u.lock_height) for op, u in utxos.items()},
+            {op: (u.amount, u.lock_height, u.created_height)
+             for op, u in utxos.items()},
             dict(replay([g, b])),
         )
 
@@ -336,7 +337,8 @@ class ReorgTests(unittest.TestCase):
         utxos2 = ledger.snapshot_utxos()
         self.assertNotIn(OutPoint("tb", 0), utxos2)
         self.assertEqual(
-            {op: (u.amount, u.lock_height) for op, u in utxos2.items()},
+            {op: (u.amount, u.lock_height, u.created_height)
+             for op, u in utxos2.items()},
             dict(replay([g, a, c])),
         )
 
