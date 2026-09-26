@@ -10,14 +10,29 @@
 - Linux 原生，安装 Python 后**无需安装任何其他依赖**
 - 不需要网络、账号、真实密钥、数据库、中间件、Docker 或云 API
 
+## venv 准备（可选）
+
+库本身只用标准库，venv 仅用于隔离解释器；仓库根的 `.venv` 是指向已备
+解释器的符号链接，也可自行创建：
+
+```bash
+python3.14 -m venv .venv        # 或任何 >= 3.10 的 python3
+.venv/bin/python -m unittest discover -s tests -v
+```
+
+不建 venv 时直接用系统 `python` 执行下文命令即可，无需 pip 安装任何包。
+
 ## 准确命令
 
 ```bash
-# 必要测试（28 个，含确定性差分测试）
+# 必要测试（37 个，含确定性差分测试与相对高度测试）
 python -m unittest discover -s tests -v
 
-# 固定输入演示（真实重组 + 实际触发的拒绝/异常边界，实测 < 0.1 秒）
+# 固定输入演示（真实重组 + 实际触发的拒绝/异常边界，实测 < 1 秒）
 python demo.py
+
+# 本轮迭代演示：相对高度要求 + 一项边界（差一块拒绝），实测 < 1 秒
+python demo_iteration.py
 ```
 
 ## 目录结构
@@ -33,7 +48,9 @@ tests/
   test_models.py  入口契约测试
   test_engine.py  场景测试
   test_differential.py  固定种子随机树差分测试（参考实现作预言机）
-demo.py           固定输入演示
+  test_relative_height.py 相对高度要求与重组创建高度测试
+demo.py           固定输入演示（基础功能）
+demo_iteration.py 固定输入演示（相对高度要求 + 边界）
 ```
 
 ## 公开数据结构
@@ -43,9 +60,9 @@ demo.py           固定输入演示
 | 类型 | 字段 | 约束 |
 |---|---|---|
 | `OutPoint` | `tx_id: str`, `index: int` | 非空字符串；`index >= 0` |
-| `TxInput` | `prev_tx: str`, `prev_index: int` | 指向一个 UTXO |
+| `TxInput` | `prev_tx: str`, `prev_index: int`, `min_relative_height: int = 0` | 指向一个 UTXO；`min_relative_height >= 0`，默认 0（旧构造方式不变） |
 | `TxOutput` | `amount: int`, `lock_height: int` | `amount >= 1`；`lock_height >= 0` |
-| `UTXO` | `amount: int`, `lock_height: int` | 与输出同构 |
+| `UTXO` | `amount: int`, `lock_height: int`, `created_height: int = 0` | 与输出同构并记住创建区块高度；由引擎在入账时写入 |
 | `Transaction` | `tx_id: str`, `inputs: tuple[TxInput,...]`, `outputs: tuple[TxOutput,...]` | 至少 1 个输出；`inputs` 为空即 **coinbase** |
 | `Block` | `block_id: str`, `parent_id: str \| None`, `work: int`, `transactions: tuple[Transaction,...]` | `work >= 1`；至少 1 笔交易；不可自为父；`parent_id=None` 表示创世 |
 
@@ -93,13 +110,22 @@ deactivated, activated)`：
    的输出；输出金额之和 ≤ 输入金额之和。
 4. **锁定高度**：被引用输出的 `lock_height <= 所在块高度` 时方可花费
    （相等允许，边界即如此定义）。
-5. **交易 ID 唯一**：同一链历史中 `tx_id` 不可复用（含跨块）。
-6. **选链**：累计 `work`（沿父链求和）最大者为活跃链；累计 work 相同取
+5. **相对高度要求**：每个交易输入带非负整数 `min_relative_height`（默认 0）。
+   UTXO 入账时记住其**创建区块高度** `created_height`；候选区块高度 `h`
+   必须满足 `h >= created_height + min_relative_height` 才允许花费该输入。
+   `0` 表示无相对要求，同一块内按依赖顺序消费本块新输出仍然合法（沿用
+   原有块内按序规则）。本规则只按区块高度计龄，**不读取真实时间，也不引入
+   绝对日期/时间戳锁**。
+6. **交易 ID 唯一**：同一链历史中 `tx_id` 不可复用（含跨块）。
+7. **选链**：累计 `work`（沿父链求和）最大者为活跃链；累计 work 相同取
    **tip 区块 ID 字典序较小**者。选链结果只取决于区块集合，与提交顺序无关。
-7. **侧枝接收**：区块先在“从创世沿父链重放得到的祖先状态”上验证；通过即
+8. **侧枝接收**：区块先在“从创世沿父链重放得到的祖先状态”上验证；通过即
    入树（即使未成为 tip），未通过则不入树、账本零变更。
-8. **原子重组**：新 tip 产生时，在临时状态上从创世重放整条新链，成功后
+9. **原子重组**：新 tip 产生时，在临时状态上从创世重放整条新链，成功后
    一次性切换 tip 与 UTXO 集合；中途异常保留旧状态（不会留下部分变更）。
+   因为验证与重组都从创世重放，UTXO 的 `created_height` 总是按**当前活跃
+   链**的区块高度重建——重组后不会沿用另一条分支上的创建高度（同一笔交易
+   在不同分支入账高度不同，花费资格随之改变，即“年龄缩短/变长”）。
 
 ## 输入上限
 
@@ -128,7 +154,11 @@ deactivated, activated)`：
 - **`BlockValidationError.reason` 稳定短码**：`duplicate-input`、
   `missing-input`、`output-locked`、`output-exceeds-input`、
   `coinbase-overflow`、`coinbase-position`、`multiple-coinbase`、
-  `duplicate-txid`、`multiple-genesis`。
+  `duplicate-txid`、`multiple-genesis`、`relative-height-not-mature`。
+- **相对高度不足**（`relative-height-not-mature`）：错误信息指出是哪个
+  输入（`tx_id` + `outpoint`）、输出创建高度、候选高度以及**还差几块**
+  （`"N block(s) short"`）与可花费高度。注意“内存里能构造出的交易”不
+  等于“放入当前高度区块合法”——合法性总是相对候选区块高度判定。
 - 失败的 `submit` 不产生未说明的部分变更：区块不入树、tip/UTXO/活跃路径
   保持提交前状态（测试 `test_failed_submit_is_atomic_against_reference`
   等逐一验证）。
@@ -142,7 +172,8 @@ deactivated, activated)`：
 - **UTXO 集以 dict 全量快照切换**：重组提交是一次引用替换，旧链状态不残留。
 - **侧枝保留**：通过祖先验证的非活跃块留在树中，之后可在其上接续更强链
   触发重组；非法块从不入树。
-- **锁定时间只实现绝对高度**一种形式；不支持时间戳、相对锁、脚本/签名。
+- **锁定只按区块高度**：绝对锁定高度（`lock_height`）与输入级相对高度
+  要求（`min_relative_height`）两种；不支持时间戳/真实日期锁、脚本/签名。
 - **金额单位无小数**：整数最小单位，全链路无浮点，因此**不存在浮点误差口径**
   ——所有余额/手续费比较都是精确整数比较。
 
@@ -159,6 +190,19 @@ deactivated, activated)`：
   恰好等于补贴+手续费的通过边界）、锁定高度（`lock == height` 可花、
   `lock > height` 拒绝）、无效侧枝不入树且不污染主链、孤儿块、重复块、
   同分字典序决胜、真实重组与重组回旧链、100 块界、失败原子性、入口契约。
+- 相对高度覆盖：恰好到期可花、差一块拒绝（错误含“还差几块”与输入定位）、
+  零要求同块链式消费、正要求同块即花拒绝、重组后创建高度随新链恢复
+  （年龄缩短，旧分支高度不残留）、失败区块零部分消费、旧未设置相对锁的
+  交易行为不变（默认 0），以及 `tests/reference.py:replay_heights` 按区块
+  历史独立重建 UTXO 创建高度作为参照（差分比对随机区块树）。
+
+## demo_iteration.py 输出内容
+
+1. **正常功能**：相对要求恰好到期时花费成功；零要求输入同块链式消费；
+   真实重组后 UTXO 创建高度按新链恢复。
+2. **实际触发的边界**：差一块的花费被 `BlockValidationError(
+   reason='relative-height-not-mature')` 拒绝，错误指出输入定位与
+   “还差几块”，且失败区块不留下部分消费。
 
 ## demo.py 输出内容
 

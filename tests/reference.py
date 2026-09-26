@@ -169,6 +169,148 @@ def replay(
     return utxos
 
 
+def replay_heights(
+    blocks: list[Block],
+    subsidy: int = 50,
+    *,
+    max_blocks: int | None = None,
+) -> dict[OutPoint, tuple[int, int, int]]:
+    """独立参照：按区块历史重建每个 UTXO 的**创建区块高度**。
+
+    返回 `{OutPoint: (amount, lock_height, created_height)}`。与
+    :func:`replay` 不共享实现：本函数用自己的一套顺序循环独立记账，并额外
+    校验交易输入的相对高度要求（`TxInput.min_relative_height`）——候选块
+    高度必须达到 `创建高度 + 要求`，不足时抛
+    :class:`ReferenceReject`（reason=`"relative-height-not-mature"`）。
+    重组后的“正确高度”由测试用本函数对**新链**重放得到，不读取引擎状态。
+    """
+    if not blocks:
+        raise ReferenceError("reference replay requires at least a genesis block")
+
+    utxos: dict[OutPoint, tuple[int, int, int]] = {}
+    seen_tx: set[str] = set()
+
+    for height, block in enumerate(blocks, start=1):
+        if max_blocks is not None and height > max_blocks:
+            raise ReferenceLimit(height, max_blocks)
+        if height == 1:
+            if block.parent_id is not None:
+                raise ReferenceReject(
+                    "bad-genesis", "first block must have parent_id=None"
+                )
+        elif block.parent_id != blocks[height - 2].block_id:
+            raise ReferenceReject(
+                "broken-chain",
+                f"block {block.block_id!r} parent does not match previous "
+                f"block {blocks[height - 2].block_id!r}",
+            )
+
+        new_utxos = dict(utxos)
+        fees = 0
+        coinbase: Transaction | None = None
+
+        for pos, tx in enumerate(block.transactions):
+            if tx.tx_id in seen_tx:
+                raise ReferenceReject(
+                    "duplicate-txid",
+                    f"tx {tx.tx_id!r} already used earlier on this chain",
+                )
+            if not tx.inputs:
+                if coinbase is not None:
+                    raise ReferenceReject(
+                        "multiple-coinbase",
+                        f"second coinbase {tx.tx_id!r} in block "
+                        f"{block.block_id!r}",
+                    )
+                if pos != 0:
+                    raise ReferenceReject(
+                        "coinbase-position",
+                        f"coinbase {tx.tx_id!r} at index {pos}, must be 0",
+                    )
+                coinbase = tx
+                for idx, out in enumerate(tx.outputs):
+                    op = OutPoint(tx.tx_id, idx)
+                    if op in new_utxos:
+                        raise ReferenceReject(
+                            "duplicate-txid", f"coinbase output collision at {op}"
+                        )
+                    new_utxos[op] = (out.amount, out.lock_height, height)
+                seen_tx.add(tx.tx_id)
+                continue
+
+            local: set[OutPoint] = set()
+            in_sum = 0
+            consumed: list[OutPoint] = []
+            for tin in tx.inputs:
+                op = OutPoint(tin.prev_tx, tin.prev_index)
+                if op in local:
+                    raise ReferenceReject(
+                        "duplicate-input",
+                        f"tx {tx.tx_id!r} spends {op} twice",
+                    )
+                local.add(op)
+                coin = new_utxos.get(op)
+                if coin is None:
+                    raise ReferenceReject(
+                        "missing-input",
+                        f"tx {tx.tx_id!r} spends unknown/spent output {op}",
+                    )
+                amount, lock, created = coin
+                if lock > height:
+                    raise ReferenceReject(
+                        "output-locked",
+                        f"tx {tx.tx_id!r} spends {op} locked until {lock} "
+                        f"at height {height}",
+                    )
+                need = tin.min_relative_height
+                mature_at = created + need
+                if height < mature_at:
+                    raise ReferenceReject(
+                        "relative-height-not-mature",
+                        f"tx {tx.tx_id!r} spends {op} created at height "
+                        f"{created} with relative requirement {need}; "
+                        f"height {height} is {mature_at - height} block(s) "
+                        f"short (spendable at {mature_at})",
+                    )
+                in_sum += amount
+                consumed.append(op)
+
+            out_sum = 0
+            for out in tx.outputs:
+                out_sum += out.amount
+            if out_sum > in_sum:
+                raise ReferenceReject(
+                    "output-exceeds-input",
+                    f"tx {tx.tx_id!r}: out={out_sum} in={in_sum}",
+                )
+            fees += in_sum - out_sum
+
+            for op in consumed:
+                del new_utxos[op]
+            for idx, out in enumerate(tx.outputs):
+                op = OutPoint(tx.tx_id, idx)
+                if op in new_utxos:
+                    raise ReferenceReject(
+                        "duplicate-txid", f"output point collision at {op}"
+                    )
+                new_utxos[op] = (out.amount, out.lock_height, height)
+            seen_tx.add(tx.tx_id)
+
+        if coinbase is not None:
+            minted = sum(o.amount for o in coinbase.outputs)
+            allowance = subsidy + fees
+            if minted > allowance:
+                raise ReferenceReject(
+                    "coinbase-overflow",
+                    f"coinbase {coinbase.tx_id!r} mints {minted} > "
+                    f"allowance {allowance}",
+                )
+
+        utxos = new_utxos
+
+    return utxos
+
+
 def best_chain(
     valid_blocks: dict[str, Block],
     work_of: dict[str, int],

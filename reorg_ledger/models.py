@@ -91,10 +91,16 @@ class OutPoint:
 
 @dataclass(frozen=True, slots=True)
 class TxInput:
-    """交易输入：指向一个未花费输出。"""
+    """交易输入：指向一个未花费输出。
+
+    ``min_relative_height`` 是非负的**相对高度要求**（默认 ``0``）：候选区块
+    高度必须达到 ``被花费输出的创建区块高度 + min_relative_height`` 才允许
+    花费。``0`` 表示无相对要求，同一块内按依赖顺序消费新输出仍然合法。
+    """
 
     prev_tx: str
     prev_index: int
+    min_relative_height: int = 0
 
     @property
     def outpoint(self) -> OutPoint:
@@ -103,6 +109,11 @@ class TxInput:
     def __post_init__(self) -> None:
         _check_str(self.prev_tx, "TxInput.prev_tx")
         _check_int(self.prev_index, "TxInput.prev_index", min_value=0)
+        _check_int(
+            self.min_relative_height,
+            "TxInput.min_relative_height",
+            min_value=0,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,17 +128,24 @@ class TxOutput:
         _check_int(self.lock_height, "TxOutput.lock_height", min_value=0)
 
 
-# UTXO 在账本状态里与 TxOutput 同构（金额 + 锁定高度）。
+# UTXO 在账本状态里与 TxOutput 同构（金额 + 锁定高度），并额外记住
+# 创建它的区块高度（相对高度要求的基准）。
 @dataclass(frozen=True, slots=True)
 class UTXO:
-    """未花费输出：金额与锁定高度。"""
+    """未花费输出：金额、锁定高度与创建区块高度。
+
+    ``created_height`` 由引擎在输出入账时写入（重组时随所在链重放而恢复，
+    不会沿用另一条分支上的高度）；手工构造时默认为 ``0``。
+    """
 
     amount: int
     lock_height: int
+    created_height: int = 0
 
     def __post_init__(self) -> None:
         _check_int(self.amount, "UTXO.amount", min_value=1)
         _check_int(self.lock_height, "UTXO.lock_height", min_value=0)
+        _check_int(self.created_height, "UTXO.created_height", min_value=0)
 
 
 @dataclass(frozen=True, slots=True)

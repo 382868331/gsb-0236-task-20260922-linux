@@ -179,7 +179,9 @@ def _apply_block_to_state(
                         "coinbase output point collides with an existing UTXO",
                         block=block, height=height, tx=tx, outpoint=op,
                     )
-                work_state.utxos[op] = UTXO(out.amount, out.lock_height)
+                work_state.utxos[op] = UTXO(
+                    out.amount, out.lock_height, created_height=height
+                )
             work_state.applied_tx_ids.add(tx.tx_id)
             continue
 
@@ -211,6 +213,18 @@ def _apply_block_to_state(
                     f"spent at height {height}",
                     block=block, height=height, tx=tx, outpoint=op,
                 )
+            required = txin.min_relative_height
+            mature_at = utxo.created_height + required
+            if height < mature_at:
+                short = mature_at - height
+                raise _ve(
+                    "relative-height-not-mature",
+                    f"input requires relative height {required} but the output "
+                    f"was created at height {utxo.created_height}; candidate "
+                    f"height {height} is {short} block(s) short "
+                    f"(spendable at height {mature_at})",
+                    block=block, height=height, tx=tx, outpoint=op,
+                )
             input_sum += utxo.amount
             resolved.append(op)
 
@@ -235,7 +249,9 @@ def _apply_block_to_state(
                     "(transaction id reused on this chain)",
                     block=block, height=height, tx=tx, outpoint=op,
                 )
-            work_state.utxos[op] = UTXO(out.amount, out.lock_height)
+            work_state.utxos[op] = UTXO(
+                out.amount, out.lock_height, created_height=height
+            )
         work_state.applied_tx_ids.add(tx.tx_id)
 
     if coinbase is not None:
