@@ -74,6 +74,40 @@ def _check_seq(value: object, path: str) -> list:
     return list(value)
 
 
+def _check_asset_map(
+    value: object, path: str
+) -> tuple[tuple[str, int], ...]:
+    """资产/销毁映射入口契约：{asset_id: 非负整数} 或 (asset_id, amount) 对序列。
+
+    归一化为按 asset_id 排序的不可变对元组，保证可哈希、可比较、顺序确定。
+    """
+    if value is None:
+        return ()
+    if isinstance(value, dict):
+        items = list(value.items())
+    else:
+        items = _check_seq(value, path)
+    pairs: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for i, item in enumerate(items):
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise InputContractError(
+                f"{path}[{i}]: expected an (asset_id, amount) pair, "
+                f"got {item!r}"
+            )
+        aid, amount = item
+        _check_str(aid, f"{path}[{i}].asset_id")
+        _check_int(amount, f"{path}[{i}].amount", min_value=0)
+        if aid in seen:
+            raise InputContractError(
+                f"{path}: duplicate asset_id {aid!r}"
+            )
+        seen.add(aid)
+        pairs.append((aid, amount))
+    pairs.sort(key=lambda p: p[0])
+    return tuple(pairs)
+
+
 @dataclass(frozen=True, slots=True)
 class OutPoint:
     """UTXO 的全局定位：创建它的交易 ID + 输出下标（从 0 开始）。"""
@@ -107,27 +141,87 @@ class TxInput:
 
 @dataclass(frozen=True, slots=True)
 class TxOutput:
-    """交易输出：正整数金额 + 锁定高度（``lock_height`` 之前不可花费）。"""
+    """交易输出：正整数基础币金额 + 锁定高度 + 可选资产/发行授权。
+
+    * assets：可选的 {asset_id: 非负整数} 映射，表示本输出额外携带的
+      各资产数量；缺省（None）即旧行为——纯基础币输出。
+    * issue_asset / issue_allowance：同时给出时，本输出是一个
+      **发行授权 UTXO**，携带资产 ID 与剩余额度。两者必须同有同无。
+      创设新资产时 issue_asset 必须等于 "<创建交易tx_id>:<输出下标>"
+      （由引擎在协议层校验）；作为发行后继时等于被消费授权的资产 ID。
+
+    assets 在构造时归一化为按 asset_id 排序的 ((asset_id, amount), ...)
+    元组；用 asset_map 属性取回字典形式。
+    """
 
     amount: int
     lock_height: int
+    assets: tuple[tuple[str, int], ...] | dict[str, int] | None = None
+    issue_asset: str | None = None
+    issue_allowance: int | None = None
 
     def __post_init__(self) -> None:
         _check_int(self.amount, "TxOutput.amount", min_value=1)
         _check_int(self.lock_height, "TxOutput.lock_height", min_value=0)
+        object.__setattr__(
+            self, "assets", _check_asset_map(self.assets, "TxOutput.assets")
+        )
+        if (self.issue_asset is None) != (self.issue_allowance is None):
+            raise InputContractError(
+                "TxOutput: issue_asset and issue_allowance must be given "
+                "together (or both omitted)"
+            )
+        if self.issue_asset is not None:
+            _check_str(self.issue_asset, "TxOutput.issue_asset")
+            _check_int(
+                self.issue_allowance, "TxOutput.issue_allowance", min_value=0
+            )
+
+    @property
+    def asset_map(self) -> dict[str, int]:
+        """资产映射的字典形式（每次调用新建，修改不影响本对象）。"""
+        return dict(self.assets)
+
+    @property
+    def is_issuance_authority(self) -> bool:
+        return self.issue_asset is not None
 
 
-# UTXO 在账本状态里与 TxOutput 同构（金额 + 锁定高度）。
+# UTXO 在账本状态里与 TxOutput 同构（金额 + 锁定高度 + 资产/授权）。
 @dataclass(frozen=True, slots=True)
 class UTXO:
-    """未花费输出：金额与锁定高度。"""
+    """未花费输出：基础币金额、锁定高度、可选资产映射与发行授权。"""
 
     amount: int
     lock_height: int
+    assets: tuple[tuple[str, int], ...] | dict[str, int] | None = None
+    issue_asset: str | None = None
+    issue_allowance: int | None = None
 
     def __post_init__(self) -> None:
         _check_int(self.amount, "UTXO.amount", min_value=1)
         _check_int(self.lock_height, "UTXO.lock_height", min_value=0)
+        object.__setattr__(
+            self, "assets", _check_asset_map(self.assets, "UTXO.assets")
+        )
+        if (self.issue_asset is None) != (self.issue_allowance is None):
+            raise InputContractError(
+                "UTXO: issue_asset and issue_allowance must be given together "
+                "(or both omitted)"
+            )
+        if self.issue_asset is not None:
+            _check_str(self.issue_asset, "UTXO.issue_asset")
+            _check_int(
+                self.issue_allowance, "UTXO.issue_allowance", min_value=0
+            )
+
+    @property
+    def asset_map(self) -> dict[str, int]:
+        return dict(self.assets)
+
+    @property
+    def is_issuance_authority(self) -> bool:
+        return self.issue_asset is not None
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,11 +231,16 @@ class Transaction:
     * ``inputs`` 为空即 **coinbase 交易**（铸币交易）；非空即为普通交易。
     * 同一交易内输入是否重复，属于协议语义，由引擎验证（可定位的
       ``duplicate-input`` 拒绝），不在构造时静默处理。
+    * burns：可选的 {asset_id: 非负整数} **显式销毁声明**。某种资产的
+      输入（加本次铸造）多于输出时，差额必须在这里逐资产声明，否则引擎
+      以 asset-burn-undeclared 拒绝；不允许用一种资产的盈余暗补另一种
+      资产的短缺。
     """
 
     tx_id: str
     inputs: tuple[TxInput, ...]
     outputs: tuple[TxOutput, ...]
+    burns: tuple[tuple[str, int], ...] | dict[str, int] | None = None
 
     def __post_init__(self) -> None:
         _check_str(self.tx_id, "Transaction.tx_id")
@@ -170,10 +269,18 @@ class Transaction:
             )
         object.__setattr__(self, "inputs", tuple(inputs))
         object.__setattr__(self, "outputs", tuple(outputs))
+        object.__setattr__(
+            self, "burns", _check_asset_map(self.burns, "Transaction.burns")
+        )
 
     @property
     def is_coinbase(self) -> bool:
         return len(self.inputs) == 0
+
+    @property
+    def burn_map(self) -> dict[str, int]:
+        """显式销毁声明的字典形式。"""
+        return dict(self.burns)
 
 
 @dataclass(frozen=True, slots=True)

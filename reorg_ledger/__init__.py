@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+from .audit import AssetTotals, audit_assets
 from .engine import (
     DEFAULT_SUBSIDY,
     MAX_CHAIN_BLOCKS,
@@ -52,4 +53,6 @@ __all__ = [
     "LedgerStateError",
     "DEFAULT_SUBSIDY",
     "MAX_CHAIN_BLOCKS",
+    "AssetTotals",
+    "audit_assets",
 ]

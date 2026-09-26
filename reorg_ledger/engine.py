@@ -128,6 +128,140 @@ def _ve(
     )
 
 
+def _check_asset_rules(
+    tx: "Transaction",
+    input_utxos: list[UTXO],
+    *,
+    block: Block,
+    height: int,
+) -> None:
+    """单笔交易的多资产守恒与发行授权规则（协议语义校验）。
+
+    对每一种资产独立成立：
+
+    * 守恒：输入资产 + 本次铸造 == 输出资产 + 显式销毁（burns）。
+      短缺不能用别的资产补（asset-exceeds-input）；未声明的销毁不允许
+      （asset-burn-undeclared）。
+    * 铸造必须消费被铸资产的发行授权 UTXO（mint-without-authority）。
+    * 发行：铸出数量 + 后继授权剩余额度 == 被消费授权的原额度
+      （allowance-mismatch）；后继授权至多一个（multiple-successors），
+      因此授权不可复制。
+    * 创设：授权输出的 issue_asset 必须等于 "<tx_id>:<输出下标>"，且只能
+      出现在有普通输入的交易里（issue-asset-mismatch / issue-in-coinbase）。
+    """
+    in_assets: dict[str, int] = {}
+    consumed_auth: dict[str, int] = {}
+    for utxo in input_utxos:
+        for aid, amount in utxo.assets:
+            in_assets[aid] = in_assets.get(aid, 0) + amount
+        if utxo.issue_asset is not None:
+            if utxo.issue_asset in consumed_auth:
+                raise _ve(
+                    "duplicate-authority",
+                    f"issuance authority for asset {utxo.issue_asset!r} is "
+                    f"consumed twice in the same transaction",
+                    block=block, height=height, tx=tx,
+                )
+            consumed_auth[utxo.issue_asset] = utxo.issue_allowance  # type: ignore[arg-type]
+
+    out_assets: dict[str, int] = {}
+    successors: dict[str, tuple[int, int]] = {}
+    for out_index, out in enumerate(tx.outputs):
+        for aid, amount in out.assets:
+            out_assets[aid] = out_assets.get(aid, 0) + amount
+        if out.issue_asset is None:
+            continue
+        derived = f"{tx.tx_id}:{out_index}"
+        if out.issue_asset == derived:
+            # 创设新授权：资产 ID 由本交易 ID 与输出位置唯一确定，
+            # 不能指定别人的 asset_id；且必须从普通基础币输入建立。
+            if tx.is_coinbase:
+                raise _ve(
+                    "issue-in-coinbase",
+                    "an issuance authority can only be created by a "
+                    "transaction spending ordinary base-coin inputs, "
+                    "not by a coinbase",
+                    block=block, height=height, tx=tx,
+                )
+            if out.issue_allowance < 1:  # type: ignore[operator]
+                raise _ve(
+                    "issue-allowance",
+                    f"new issuance authority for {out.issue_asset!r} must "
+                    f"start with allowance >= 1",
+                    block=block, height=height, tx=tx,
+                )
+        elif out.issue_asset in consumed_auth:
+            # 发行后继授权：延续同一资产，至多一个。
+            if out.issue_asset in successors:
+                raise _ve(
+                    "multiple-successors",
+                    f"more than one successor authority for asset "
+                    f"{out.issue_asset!r} (authority cannot be duplicated)",
+                    block=block, height=height, tx=tx,
+                )
+            successors[out.issue_asset] = (out_index, out.issue_allowance)  # type: ignore[assignment]
+        else:
+            raise _ve(
+                "issue-asset-mismatch",
+                f"output #{out_index} declares authority for asset "
+                f"{out.issue_asset!r}, which is neither this transaction's "
+                f"own derived id {derived!r} nor an authority consumed by "
+                f"this transaction",
+                block=block, height=height, tx=tx,
+            )
+
+    burns: dict[str, int] = {}
+    for aid, amount in tx.burns:
+        burns[aid] = burns.get(aid, 0) + amount
+
+    asset_ids = (
+        set(in_assets) | set(out_assets) | set(burns) | set(consumed_auth)
+    )
+    for aid in sorted(asset_ids):
+        in_amt = in_assets.get(aid, 0)
+        out_amt = out_assets.get(aid, 0)
+        burn_amt = burns.get(aid, 0)
+        minted = out_amt + burn_amt - in_amt
+        if aid in consumed_auth:
+            if minted < 0:
+                raise _ve(
+                    "asset-burn-undeclared",
+                    f"asset {aid!r}: inputs exceed outputs plus declared "
+                    f"burns by {-minted} (destruction must be declared "
+                    f"explicitly)",
+                    block=block, height=height, tx=tx,
+                )
+            successor_allowance = (
+                successors[aid][1] if aid in successors else 0
+            )
+            if minted + successor_allowance != consumed_auth[aid]:
+                raise _ve(
+                    "allowance-mismatch",
+                    f"asset {aid!r}: minted {minted} + successor allowance "
+                    f"{successor_allowance} != consumed authority allowance "
+                    f"{consumed_auth[aid]} (allowance must be fully "
+                    f"accounted for)",
+                    block=block, height=height, tx=tx,
+                )
+        else:
+            if minted > 0:
+                raise _ve(
+                    "mint-without-authority",
+                    f"asset {aid!r}: outputs+burns exceed inputs by {minted} "
+                    f"but no issuance authority for this asset is consumed",
+                    block=block, height=height, tx=tx,
+                )
+            if minted < 0:
+                raise _ve(
+                    "asset-burn-undeclared",
+                    f"asset {aid!r}: inputs exceed outputs plus declared "
+                    f"burns by {-minted} (destruction must be declared "
+                    f"explicitly; one asset's surplus cannot cover another "
+                    f"asset's deficit)",
+                    block=block, height=height, tx=tx,
+                )
+
+
 def _apply_block_to_state(
     state: _UtxoState,
     block: Block,
@@ -171,6 +305,8 @@ def _apply_block_to_state(
                     block=block, height=height, tx=tx,
                 )
             coinbase = tx
+            # coinbase 无输入：任何资产/授权输出都会在这里被证伪。
+            _check_asset_rules(tx, [], block=block, height=height)
             for out_index, out in enumerate(tx.outputs):
                 op = OutPoint(tx.tx_id, out_index)
                 if op in work_state.utxos:
@@ -179,7 +315,10 @@ def _apply_block_to_state(
                         "coinbase output point collides with an existing UTXO",
                         block=block, height=height, tx=tx, outpoint=op,
                     )
-                work_state.utxos[op] = UTXO(out.amount, out.lock_height)
+                work_state.utxos[op] = UTXO(
+                    out.amount, out.lock_height, out.assets,
+                    out.issue_asset, out.issue_allowance,
+                )
             work_state.applied_tx_ids.add(tx.tx_id)
             continue
 
@@ -187,6 +326,7 @@ def _apply_block_to_state(
         seen: set[OutPoint] = set()
         input_sum = 0
         resolved: list[OutPoint] = []
+        resolved_utxos: list[UTXO] = []
         for txin in tx.inputs:
             op = txin.outpoint
             if op in seen:
@@ -213,6 +353,7 @@ def _apply_block_to_state(
                 )
             input_sum += utxo.amount
             resolved.append(op)
+            resolved_utxos.append(utxo)
 
         output_sum = sum(o.amount for o in tx.outputs)
         if output_sum > input_sum:
@@ -222,6 +363,9 @@ def _apply_block_to_state(
                 block=block, height=height, tx=tx,
             )
         total_fees += input_sum - output_sum
+
+        # --- 多资产守恒 + 发行授权规则（逐资产独立，销毁须显式声明） ---
+        _check_asset_rules(tx, resolved_utxos, block=block, height=height)
 
         # --- 提交该交易：移除输入、新增输出（严格按序，后者可花前者输出） ---
         for op in resolved:
@@ -235,7 +379,10 @@ def _apply_block_to_state(
                     "(transaction id reused on this chain)",
                     block=block, height=height, tx=tx, outpoint=op,
                 )
-            work_state.utxos[op] = UTXO(out.amount, out.lock_height)
+            work_state.utxos[op] = UTXO(
+                out.amount, out.lock_height, out.assets,
+                out.issue_asset, out.issue_allowance,
+            )
         work_state.applied_tx_ids.add(tx.tx_id)
 
     if coinbase is not None:

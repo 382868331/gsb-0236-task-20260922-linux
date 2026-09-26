@@ -13,11 +13,17 @@
 ## 准确命令
 
 ```bash
-# 必要测试（28 个，含确定性差分测试）
+# 准备（可选）：用仓库自带 venv 或系统 Python 3.14.7 均可，无第三方依赖
+# python3 -m venv .venv && . .venv/bin/activate
+
+# 必要测试（41 个，含确定性差分测试与多资产/发行授权场景）
 python -m unittest discover -s tests -v
 
 # 固定输入演示（真实重组 + 实际触发的拒绝/异常边界，实测 < 0.1 秒）
 python demo.py
+
+# 本轮迭代演示：多资产、发行授权、显式销毁、额度耗尽、重组恢复（实测 < 1 秒）
+python demo_iteration.py
 ```
 
 ## 目录结构
@@ -28,12 +34,15 @@ reorg_ledger/
   models.py       数据结构 + 入口契约校验（类型/取值范围）
   engine.py       核心算法：区块树、祖先状态验证、选链、原子重组
   errors.py       错误语义（异常分类与可定位字段）
+  audit.py        独立资产审计（从交易历史+当前UTXO重算各资产账目，不被引擎使用）
 tests/
   reference.py    独立参考实现（从创世逐链重放 + 独立选链），不调用被测核心
   test_models.py  入口契约测试
   test_engine.py  场景测试
   test_differential.py  固定种子随机树差分测试（参考实现作预言机）
+  test_assets.py  多资产与发行授权场景 + 独立审计对照
 demo.py           固定输入演示
+demo_iteration.py 本轮迭代演示（多资产 + 发行授权）
 ```
 
 ## 公开数据结构
@@ -44,9 +53,14 @@ demo.py           固定输入演示
 |---|---|---|
 | `OutPoint` | `tx_id: str`, `index: int` | 非空字符串；`index >= 0` |
 | `TxInput` | `prev_tx: str`, `prev_index: int` | 指向一个 UTXO |
-| `TxOutput` | `amount: int`, `lock_height: int` | `amount >= 1`；`lock_height >= 0` |
-| `UTXO` | `amount: int`, `lock_height: int` | 与输出同构 |
-| `Transaction` | `tx_id: str`, `inputs: tuple[TxInput,...]`, `outputs: tuple[TxOutput,...]` | 至少 1 个输出；`inputs` 为空即 **coinbase** |
+| `TxOutput` | `amount: int`, `lock_height: int`, `assets=None`, `issue_asset=None`, `issue_allowance=None` | `amount >= 1`；`lock_height >= 0`；资产数量为非负整数；`issue_*` 须同有同无 |
+| `UTXO` | 与 `TxOutput` 同构 | 同左 |
+| `Transaction` | `tx_id: str`, `inputs`, `outputs`, `burns=None` | 至少 1 个输出；`inputs` 为空即 **coinbase**；`burns` 为逐资产显式销毁声明 |
+
+资产/销毁映射接受 `{asset_id: 非负整数}` 字典或 `(asset_id, amount)` 对序列，
+构造时归一化为按 asset_id 排序的元组（可哈希、可比较），用 `asset_map` /
+`burn_map` 属性取回字典形式。缺省 `None` 即旧行为（纯基础币），
+没有资产字段的旧交易语义完全不变。
 | `Block` | `block_id: str`, `parent_id: str \| None`, `work: int`, `transactions: tuple[Transaction,...]` | `work >= 1`；至少 1 笔交易；不可自为父；`parent_id=None` 表示创世 |
 
 ## 接口
@@ -82,6 +96,29 @@ deactivated, activated)`：
 - `deactivated`：旧 tip 向下至分叉点之后的被撤销块（撤销顺序）
 - `activated`：分叉点之后向上至新 tip 的被应用块（应用顺序）
 - 同链向前延伸（无撤销块）时 `reorganized=False`、`reorg=None`
+
+## 多资产与发行授权（本轮新增）
+
+1. **可选资产映射**：输出/UTXO 可携带 {asset_id: 非负整数} 的资产数量；
+   基础币 amount 仍按旧规则计费（手续费 = 输入和 − 输出和，只计基础币）。
+2. **逐资产分别守恒**：对每种资产独立成立
+   “输入资产 + 本次铸造 == 输出资产 + 显式销毁(burns)”。
+   短缺不能用另一种资产的盈余补；未声明的销毁一律拒绝。
+3. **发行授权 UTXO**：输出同时给出 issue_asset + issue_allowance 即为授权，
+   携带资产 ID 与剩余额度。发行必须消费该授权；**铸出数量 + 后继授权剩余
+   额度 == 被消费授权的原额度**；后继至多一个，授权不可复制。额度全部铸出
+   且无后继时授权消失（额度耗尽）。
+4. **资产 ID 派生**：新资产 ID 固定为 <创设交易tx_id>:<输出下标>，由创设
+   交易的完整 ID 与输出位置确定；创设交易必须花费普通基础币输入（不能是
+   coinbase），且不得指定别人的 asset_id。
+5. **块内顺序**：同一区块内可先发后转、甚至同块二次发行（消费前一笔的
+   后继授权），按交易顺序逐笔结算。
+6. **重组恢复**：重组沿用原有“撤销旧链 → 应用新链”的原子机制，各资产
+   数量与授权（含剩余额度）随旧链撤销、新链应用一并恢复。
+7. **独立审计**：reorg_ledger.audit.audit_assets(blocks, utxos) 是不被引擎
+   使用的独立对照实现，从交易历史与当前 UTXO 集重算各资产的已发行 /
+   已销毁 / 在外数量并核对守恒（已发行 − 已销毁 == 在外数量），不成立时
+   抛 LedgerStateError。
 
 ## 协议语义（本题契约子集）
 
@@ -129,6 +166,12 @@ deactivated, activated)`：
   `missing-input`、`output-locked`、`output-exceeds-input`、
   `coinbase-overflow`、`coinbase-position`、`multiple-coinbase`、
   `duplicate-txid`、`multiple-genesis`。
+  多资产/发行新增：`asset-burn-undeclared`（未声明销毁/跨资产补短）、
+  `mint-without-authority`（无授权铸造）、`allowance-mismatch`
+  （铸出+后继≠原额度）、`multiple-successors`（授权复制）、
+  `issue-asset-mismatch`（指定别人的 asset_id）、`issue-in-coinbase`
+  （coinbase 创设授权）、`issue-allowance`（初始额度 < 1）、
+  `duplicate-authority`（同交易重复消费同一授权）。
 - 失败的 `submit` 不产生未说明的部分变更：区块不入树、tip/UTXO/活跃路径
   保持提交前状态（测试 `test_failed_submit_is_atomic_against_reference`
   等逐一验证）。
@@ -172,6 +215,8 @@ deactivated, activated)`：
 
 ## 已知限制
 
+- 资产模型为记账式最小子集：无资产元数据、无小数位、无授权冻结/吊销；
+  不接真实链、不连接任何交易平台。
 - 仅实现本题的有限协议子集：无签名/脚本验证、无时间戳与时间锁、无对等网络、
   无持久化、无内存池/费用市场、无难度调整，**不宣称与任何行业完整协议
   （Bitcoin 等）兼容**。
